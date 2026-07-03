@@ -13,6 +13,8 @@ complete mental model of the platform before working on it.
 
 - The course itself lives in [`README.md`](./README.md) — one growing document, taught as numbered
   **Steps** (Step 1, Step 2, …). It renders as the repo homepage on GitHub.
+- [`ISSUES.md`](./ISSUES.md) — a **living register of problems/gaps/tech-debt** found in the platform.
+  Append to it whenever a new issue surfaces while teaching.
 - This `CONTEXT.md` is meta: it tracks progress and how to resume. It is **not** course content.
 
 ## 2. Teaching contract (how the course is delivered)
@@ -84,11 +86,15 @@ Update this every time a Step is written.
 ```bash
 # 1. Append the Step's content to README.md (in the learning repo).
 # 2. Update the Progress table in CONTEXT.md (mark the Step ✅, set "Current position").
+# 3. If the Step surfaced any problems/gaps, append them to ISSUES.md.
 cd ~/leadplus-learning
 git add -A
 git commit -m "course: add Step N — <title>"
 git push
 ```
+
+> Keep `ISSUES.md` current: any bug, risk, smell, or gap found while teaching gets a row there
+> (next sequential ID, severity, status, location). It's the platform's tech-debt register.
 
 ## 7. Repo / environment notes
 - This learning repo: local `~/leadplus-learning`, remote `https://github.com/Jathin04Jan/Leadplus-learning.git`, branch `main`.
