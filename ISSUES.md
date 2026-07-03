@@ -72,6 +72,15 @@ A living log of problems, risks, and gaps found in the LeadPlus platform while l
 | A2 | Layer inversions: `Campaign` entity imports application-layer `LeadFilterCriteria`; admin `IndustryRepository` imports a campaign DTO. | 🟡 | 🔵 | Flagged in audits. |
 | A3 | Backlog of audited boundary violations in the "8 non-strict" modules recorded in `leadplus-service/docs/migration/boundary-violations.csv` (note: the test now scans all 11, so most enforced ones are resolved). | 🟡 | ⚪ | tracking CSV |
 
+## 7. AI layer (`shared/ai`)
+
+| # | Issue | Sev | Status | Where / notes |
+|---|-------|-----|--------|---------------|
+| AI1 | **Unused Anthropic starter forces a mandatory config key** — `spring-ai-starter-model-anthropic` is on the classpath (from the migration's "Agent Factory" deps) and auto-configures an `anthropicApi` bean that **requires `spring.ai.anthropic.api-key` at startup**, but **no Java code uses Anthropic** — every real AI call goes through OpenAI (`gpt-4.1-mini`, `OpenAiChatModel`). So the app carries a mandatory secret for a feature that doesn't exist. Already caused boot failure `M4`. | 🟡 | 🔵 | `build.gradle`; `application.yml` (`spring.ai.anthropic.api-key`). Remove the dep until Agent Factory lands, or disable its auto-config. |
+| AI2 | **Prompts/templates loaded at static class-init** — 5 classes do `static final String X = FileReader.readFileContentFromClasspath("…")`. Any missing/misnamed resource throws `ExceptionInInitializerError` and **crashes the whole app at startup** with a cryptic error (not a clean message). This is exactly what caused boot failure `M3`. | 🟠 | 🔵 | `ChatService`, `LeadChatService`, `ContactEmailAiService`, `EmailPreviewService` (×2). Move to `@PostConstruct`/lazy with a clear error message. |
+| AI3 | **`MessageController.getConversations` hardcodes `MessageType.CAMPAIGN_AGENT`** — a generically-named "get conversations" endpoint only ever returns campaign-agent conversations; it's really a campaign-agent query mislabeled as generic. | 🟡 | 🔵 | `shared/ai/controller/MessageController.java` |
+| AI4 | **Dead AI-disable flags + illusory graceful degradation.** `spring.spring-ai.enabled: false` and `app.spring-ai.enabled: false` are in `application.yml` but **read by no code** (dead flags). The AI beans are **unconditional** `@Component`s, so `Optional<SpringAiClient>` is never empty → `AIServicesModule.getChatCompletion`'s `.orElse(null)` ("returns null when AI not configured") is **unreachable dead code** and its javadoc is wrong. Real behavior: AI is **always on**; with the dummy staging key, AI feature calls **throw a 401 at runtime** instead of degrading. There is effectively **no working kill-switch for AI**, contrary to what the config implies. | 🟠 | 🔵 | `shared/ai/AIServicesModule.java`, `SpringAiClient.java`, `application.yml`. Note `parseVendorSearchQuery` *throws* when unavailable while `getChatCompletion` *returns null* — inconsistent, and the null path can't actually trigger. Related: A1. |
+
 ---
 
 ## How to append
