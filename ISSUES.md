@@ -71,6 +71,7 @@ A living log of problems, risks, and gaps found in the LeadPlus platform while l
 | A1 | Two pre-existing AI-call bypasses call `SpringAiClient` directly instead of `AIServicesModule` (`CampaignEmailAiService`, `ContactEmailAiService`) — exempted in the boundary test, tracked as a follow-up ticket. | 🟡 | ⚪ | `leadgen/campaign/service/` |
 | A2 | Layer inversions: `Campaign` entity imports application-layer `LeadFilterCriteria`; admin `IndustryRepository` imports a campaign DTO. | 🟡 | 🔵 | Flagged in audits. |
 | A3 | Backlog of audited boundary violations in the "8 non-strict" modules recorded in `leadplus-service/docs/migration/boundary-violations.csv` (note: the test now scans all 11, so most enforced ones are resolved). | 🟡 | ⚪ | tracking CSV |
+| A4 | **`ModuleBoundariesTest` is a suffix heuristic, not a true arch gate** — it only flags cross-module imports whose simple name ends in `Service`/`Repository`/`Client`. So forbidden imports that *don't* match the suffix slip through undetected: cross-module **`Entity`** imports (the rule forbids them), controller-layer classes (e.g. rfq controllers import vendor's `VendorValidator` — a real leak), and `*Util` helpers. "Green boundary test" ≠ "clean boundaries." | 🟠 | 🔵 | `src/test/java/ai/leadplus/ModuleBoundariesTest.java` (INTERNAL regex). Consider ArchUnit for real package-dependency rules. |
 
 ## 7. AI layer (`shared/ai`)
 

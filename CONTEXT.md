@@ -64,7 +64,7 @@ Update this every time a Step is written.
 | Step | Title | Status |
 |------|-------|--------|
 | 1 | Big picture — domain, deployables, tech, architectural style, request trace | ✅ written |
-| 2 | Modular-monolith architecture — modules, `*Module` facades, boundary rule & enforcement, events, cycles | ⬜ next |
+| 2 | Modular-monolith architecture — modules, `*Module` facades, boundary rule & enforcement, events, cycles | ✅ written |
 | 3 | Identity & multi-tenancy — auth (JWT/login/signup/OAuth) + workspace (tenant→workspace→user) | ⬜ |
 | 4 | LeadGen engine — search → campaign → outreach → tracking | ⬜ |
 | 5 | RFQ marketplace — buyer / vendor / rfq | ⬜ |
@@ -74,7 +74,7 @@ Update this every time a Step is written.
 | 9 | Build / run / deploy — Gradle, schema/validate, CI/CD, config & secrets | ⬜ |
 | 10 | Migration context — refactor, phases, Java-now/Python-later, known issues | ⬜ |
 
-**Current position:** Step 1 written & pushed. Learner is reading it. **Next action = teach Step 2.**
+**Current position:** Steps 1–2 written & pushed. **Next action = teach Step 3 (Identity & multi-tenancy).**
 
 ## 6. How to resume (do this in a fresh session)
 1. Read this `CONTEXT.md` and `README.md` to see how far the course got (Progress table + last Step).

@@ -15,7 +15,7 @@ depth; read it, ask follow-ups, then advance to the next.
 ## Roadmap
 
 1. **Big picture** — domain, deployables, tech stack, architectural style, an end-to-end request trace ✅
-2. **Modular-monolith architecture** — the 11 modules, the `*Module` facade pattern, the boundary rule & enforcement, events, cycle resolution
+2. **Modular-monolith architecture** — the 11 modules, the `*Module` facade pattern, the boundary rule & enforcement, events, cycle resolution ✅
 3. **Identity & multi-tenancy** — `auth` (JWT/login/signup/OAuth) + `workspace` (tenant→workspace→user); how a request is authenticated and scoped
 4. **The LeadGen engine** — `search → campaign → outreach → tracking` (leads, sequences, the send cron, reply/bounce/unsubscribe)
 5. **The RFQ marketplace** — `buyer / vendor / rfq` (onboarding, RFQ→quotation lifecycle, collaborators)
@@ -96,3 +96,179 @@ The recurring pattern: **modules never touch each other's internals — they cal
 ## Two takeaways from Step 1
 1. It's **one Spring Boot app split into 11 strictly-bounded modules**.
 2. The **facade (`*Module`) + events** pattern is how modules talk.
+
+---
+
+# Step 2 — The modular-monolith architecture
+
+This is the backbone of the whole system. If you understand this step deeply, the rest of the
+codebase reads itself. The goal of the design: **get the module boundaries of a future
+microservices/Python split right *now*, while still shipping one easy-to-run Spring Boot app.**
+
+## 2.1 The physical layout (a module on disk)
+Every module lives under `src/main/java/ai/leadplus/<module>/` (package root is `ai.leadplus`, **not** `com.leadplus`) and always has the same shape:
+
+```
+leadgen/campaign/
+├── CampaignModule.java        ← the ONE public class other modules may import (the facade)
+├── CONTEXT.md                 ← the module's contract: Owns (tables), Public interface, Business rules
+├── controller/                ← REST endpoints (@RestController)
+├── service/                   ← business logic (@Service) + the module's DTOs/enums/events
+├── repository/                ← Spring Data JPA interfaces (@Repository)
+└── model/                     ← JPA @Entity classes (the tables this module OWNS)
+```
+
+Two files matter most when you start on a module:
+- **`CONTEXT.md`** — read it *first*. It states which **tables the module owns**, its **public interface**, and its **business rules**. (⚠️ these are partly stale — some say the `*Module` is "Planned"; it isn't. Trust the code — see ISSUES.md X2.)
+- **`<Name>Module.java`** — the module's single public door.
+
+## 2.2 The rule (the single most important thing in this repo)
+
+> **A module may NEVER import another module's `Service`, `Repository`, `Client`, or `Entity`.**
+> Cross-module access happens only through the target module's public **`<Name>Module`** facade,
+> or by listening to an **event** it publishes.
+
+What a module **is** allowed to import from another module (the "module-API surface"):
+1. The other module's **`<Name>Module`** class.
+2. The **DTOs / models / enums / events** that the facade's methods accept or return (these are the contract types — mostly in the other module's `service/` package).
+3. A small **shared allowlist**: `application.{common,exception}`, `domain.common`, `api.common.datetime`, `api.configurations` (bootstrap), and the validators in `shared/workspace/controller/common`.
+
+Everything else across a module boundary is forbidden. The intuition: a module's `model/`
+(entities) and `repository/` (tables) are its **private data**; nobody reaches into another
+module's database — they *ask* via the facade.
+
+## 2.3 The facade in practice
+Here's a **real** example — the outreach send-cron. It needs data from campaign, tracking, and
+workspace. Look at what it imports:
+
+```java
+// leadgen/outreach/service/CampaignOrchestratorService.java
+import ai.leadplus.leadgen.campaign.CampaignModule;          // ✅ facade
+import ai.leadplus.leadgen.tracking.TrackingModule;          // ✅ facade
+import ai.leadplus.shared.workspace.WorkspaceModule;         // ✅ facade
+import ai.leadplus.leadgen.campaign.service.CampaignDto;     // ✅ a DTO the facade returns
+import ai.leadplus.shared.workspace.service.MailboxDto;      // ✅ a DTO the facade returns
+// NOT allowed (and absent): campaign.repository.CampaignRepository, campaign.model.Campaign, …
+```
+
+And the calls are all through the facade:
+```java
+campaignModule.getTopCampaignContactToMail();      // instead of touching CampaignRepository
+trackingModule.validateContactEligibility(...);    // instead of touching ContactOutreachStatusRepository
+workspaceModule.getMailbox(mailboxId);             // instead of touching MailboxRepository
+```
+
+**What a `*Module` class actually is:** a thin `@Component` that *delegates* to the module's own
+internal services and maps internal entities → public DTOs. It adds no logic; it's a **published
+contract**. Example shape:
+
+```java
+@Component
+@RequiredArgsConstructor
+public class CampaignModule {                    // the ONLY class outsiders import
+    private final CampaignContactService campaignContactService;   // internal, private
+    public Optional<CampaignContactInfoDto> getTopCampaignContactToMail() {
+        return campaignContactService.getTopContactToMail();       // delegate
+    }
+    // ... ~20-60 such methods per module
+}
+```
+
+`WorkspaceModule` is the biggest (~60 methods, the multi-tenancy foundation); `portal/buyer`
+owns no tables and has no facade yet (it's a thin orchestration layer over other facades).
+
+## 2.4 Events — the *other* cross-module channel
+Facades are for **"I need data now" (synchronous pull)**. Events are for **"something happened,
+whoever cares can react" (asynchronous, decoupled push)**. Used when a hard dependency would
+create a cycle or unwanted coupling.
+
+Rules for events here:
+- **Payloads carry IDs + at most cheap primitives — never DTOs.** Listeners re-fetch fresh state
+  via the owning module's facade. (This keeps modules from coupling on each other's data shapes.)
+- Publish with Spring's `ApplicationEventPublisher`; consume with `@EventListener` (often `@Async`).
+
+Real example — one publish, three independent reactions (fully decoupled):
+```
+outreach: publishes CampaignEmailSentEvent(contactId, campaignId, stepNumber, …)   // IDs only
+   ├─ tracking  @EventListener → stamp last-email time / status
+   ├─ workspace @EventListener → increment the mailbox's emailsSentToday counter
+   └─ search    @EventListener → write a "campaign email sent" row on the lead timeline
+```
+The outreach module has **no idea** those three listeners exist — that's the point.
+(Scale in the repo: **27** `*Event` types, **11** classes with `@EventListener`.)
+
+The classic use is breaking a would-be cycle: **campaign ↔ tracking**. A reply detected in
+tracking must flip a campaign contact to `REPLIED`. Instead of tracking depending on campaign at
+construction time, tracking **publishes `ReplyReceivedEvent`** and campaign **listens**. Dependency
+inverted, no cycle.
+
+## 2.5 How the boundary is *enforced* — `ModuleBoundariesTest`
+This is not a convention people remember to follow — it's a **build-failing test**. Understand
+exactly how it works, including its blind spot:
+
+`src/test/java/ai/leadplus/ModuleBoundariesTest.java` is a **source-scanning regex test** (not
+ArchUnit, not bytecode). For each module it:
+1. Walks every `.java` file under that module.
+2. Regex-matches `import ai.leadplus.…;` lines.
+3. Flags an import as a **violation** only if ALL of:
+   - it belongs to a *different* module (the shared allowlist isn't in the module map, so it passes),
+   - **its simple name ends in `Service`, `Repository`, or `Client`** (`INTERNAL` pattern),
+   - it isn't one of the documented exemptions.
+4. Asserts zero violations. There's a `@Test` for **all 11 modules** (docs saying "3–5 strict" are stale — ISSUES.md X3).
+
+**Exemptions (6, encoded in the test):** 4 shared OAuth/label adapter clients in workspace that
+outreach's send paths use, + 2 pre-existing `SpringAiClient` bypass files in campaign
+(`CampaignEmailAiService`, `ContactEmailAiService` — see ISSUES.md A1).
+
+**⚠️ The blind spot (architect, note this):** the check is a **suffix heuristic**, not a true
+architecture gate. Because it only flags `*Service`/`*Repository`/`*Client`, these slip through
+undetected even though the *rule* forbids them:
+- cross-module **`Entity`** imports (the rule says no, the test doesn't catch it),
+- controller-layer classes like another module's `VendorValidator` (rfq controllers actually import
+  vendor's `VendorValidator` — a real leak the test misses),
+- `*Util` helper classes from another module.
+So "green boundary test" ≠ "clean boundaries." (Logged as an enforcement gap — ISSUES.md A4-adjacent.)
+
+## 2.6 Dependency cycles & the `@Lazy` resolution
+Because facades call each other, you can get **construction cycles** (Spring can't build bean A if
+it needs B which needs A). Four were resolved up front, by choosing a **leaf** or inverting to events:
+- `auth ↔ workspace` → **auth is the leaf** (identity only; tenant resolution lives in workspace).
+- `buyer ↔ rfq` and `vendor ↔ rfq` → **rfq is the leaf** (buyer/vendor context passed *in* as parameters).
+- `campaign ↔ tracking` → **event-based** (tracking publishes, campaign listens).
+
+For the remaining back-edges, they break the *constructor* cycle with **`@Lazy`** on the injected
+facade field — Spring injects a proxy and resolves the real bean on first use:
+```java
+@Lazy private final LeadFileImportService leadFileImportService;   // breaks admin→…→admin cycle
+```
+This works with Lombok's `@RequiredArgsConstructor` because `lombok.config` copies `@Lazy` from the
+field onto the generated constructor parameter:
+```
+lombok.copyableAnnotations += org.springframework.context.annotation.Lazy
+```
+> War story from this repo: green unit tests once passed while the app **couldn't boot** because of
+> exactly these cycles. That's why there's a full-context boot smoke test
+> (`RUN_CONTEXT_TESTS=true`) — compile-green ≠ boot-green here.
+
+## 2.7 The payoff, and how you add a feature
+**Payoff:** each module is independently reasoned-about and, in principle, independently
+extractable. The AI module (`shared/ai`) is the deliberate first target — same `AIServicesModule`
+interface, implementation swapped for an HTTP client to a Python service later. The boundaries you
+maintain today *are* the future service boundaries.
+
+**The workflow when you add a feature (from CLAUDE.md):**
+1. Read the owning module's `CONTEXT.md`.
+2. Decide which **single** module owns the feature.
+3. If it needs data from another module, add a method to *that* module's `<Name>Module` facade
+   (or publish/consume an event) — never import its internals.
+4. Update the `CONTEXT.md`, add/adjust a boundary-respecting test, keep `./gradlew test` green.
+
+## Takeaways from Step 2
+1. **Facade + events** are the only two legal cross-module channels; internals (`model`/`repository`/
+   `service`) are private.
+2. Boundaries are **enforced by a build test** — but it's a *suffix heuristic* with real blind spots
+   (entities, validators, utils), so green ≠ perfectly clean.
+3. Cycles are resolved by **leaf-designation, event-inversion, or `@Lazy`** — and boot-testing
+   matters because compile-green didn't guarantee boot.
+4. This structure exists to make the **future extraction** (AI → Python, and beyond) a boundary
+   already drawn.
