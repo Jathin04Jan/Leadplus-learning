@@ -453,6 +453,39 @@ Key concepts:
   writing `lead_contact_event` rows. So a contact's timeline ("emailed step 1", "replied") is
   assembled passively from events fired by the other three modules.
 
+### 4.1.1 How leads get *into* the pool (ingestion) — and the two-datasets trap
+The lead pool doesn't fill itself. A `lead_company`/`lead_contact` row is created by exactly these
+paths (everything else *enriches* an existing row):
+
+| Path | Code | Notes |
+|------|------|-------|
+| **Admin bulk import** 🥇 | `LeadFileImportService.processCompanyRow/ContactRow` (admin) → `searchModule.saveCompany/Contact` | The primary seeding mechanism — the platform operator uploads a CSV/Excel of companies/contacts. |
+| **Direct create API** | `LeadCompanyController` `@PostMapping` / `@PutMapping` | Programmatic/single create. |
+| **Tenant contact import** | `TenantContactImportService` (search; migration feature) | A tenant imports *contacts*; new companies are auto-created as a side effect. |
+| **Manual contact add** | `ContactAddService` (search) | Add one contact; its new company is created as a side effect. |
+
+**Not creation paths** (they require the company to already exist):
+- **Apollo** — people-search & org-enrich both start with `getCompanyByIdOrDomain(...)`; they *enrich*, never seed.
+- **Scraper** — operates on `lead_company_job` (job postings) for existing companies.
+
+**The lifecycle:** `SEED (import/manual)` → `ENRICH (Apollo people/org, scraper jobs)` → `READ
+(tenants search the local pool)`. Apollo can't run until seeding has put the company (with a domain)
+in the pool — that's the chicken-and-egg.
+
+**⚠️ The two-datasets trap (verified):** there are **two separate "company/contact" table sets**, and
+conflating them is a common mistake:
+
+| Table set | Owner | Filled by | Purpose |
+|-----------|-------|-----------|---------|
+| `lead_company` / `lead_contact` | **search** | import / manual (then Apollo/scraper enrich) | the **shared prospecting pool** you *search* |
+| `tenant_company` / `tenant_contact` | **workspace** | **CRM sync** (Zoho/HubSpot) — all four sync services write via `TenantCompanyService`/`TenantContactService` | a **per-tenant mirror of the tenant's own CRM** |
+
+CRM sync feeds the *workspace* tables **only** — it does **not** add anything to the search
+prospecting pool (verified: the Zoho/HubSpot sync services never touch `LeadCompany`/`LeadContact`).
+So "connect your HubSpot" ≠ "add companies to prospecting." The two datasets aren't linked, so the
+same real company can exist independently in both — worth remembering when building any feature that
+spans "my CRM" and "the prospecting database."
+
 ## 4.2 `campaign` — the plan (the most complex module)
 Owns `campaign`, `campaign_contact`, `campaign_email` (the sequence steps), `contact_email` (one-off
 sends), `sequence_template`, `timezone_mapping`, `campaign_chat_memory`.
