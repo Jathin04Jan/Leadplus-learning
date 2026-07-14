@@ -17,7 +17,7 @@ depth; read it, ask follow-ups, then advance to the next.
 1. **Big picture** — domain, deployables, tech stack, architectural style, an end-to-end request trace ✅
 2. **Modular-monolith architecture** — the 11 modules, the `*Module` facade pattern, the boundary rule & enforcement, events, cycle resolution ✅
 3. **Identity & multi-tenancy** — `auth` (JWT/login/signup/OAuth) + `workspace` (tenant→workspace→user); how a request is authenticated and scoped ✅
-4. **The LeadGen engine** — `search → campaign → outreach → tracking` (leads, sequences, the send cron, reply/bounce/unsubscribe)
+4. **The LeadGen engine** — `search → campaign → outreach → tracking` (leads, sequences, the send cron, reply/bounce/unsubscribe) ✅
 5. **The RFQ marketplace** — `buyer / vendor / rfq` (onboarding, RFQ→quotation lifecycle, collaborators)
 6. **The AI module** — how all AI funnels through `AIServicesModule`, prompts, chat memory, the Python-extraction seam
 7. **Cross-cutting** — security filter chains, exceptions, timezones, events, schedulers, S3/email infra
@@ -416,3 +416,151 @@ listens for to create the vendor row (Step-2's event pattern in action).
 3. The **JWT carries `tenantId`+`workspaceId`+`roles`** → stateless auth; refresh re-reads live state.
 4. Multi-tenancy is enforced by **URL path + validators, manually** — there's **no automatic tenant
    isolation** (no RLS/Hibernate filter), which is a first-class risk (ISSUES.md S6).
+
+---
+
+# Step 4 — The LeadGen engine (`search → campaign → outreach → tracking`)
+
+This is the core product and the most operationally sensitive code. Think of it as a **4-stage
+assembly line**, each stage a module, connected by facades (synchronous pulls) and events
+(asynchronous reactions):
+
+```
+ search            campaign             outreach            tracking
+ (the leads)  →    (the plan)      →    (the send)     →    (the feedback)
+ who exists        who gets what,       actually mail       what happened after:
+ & their data      in what sequence,    it, via the         replies, bounces,
+                   in what window        tenant's mailbox    unsubscribes
+```
+
+## 4.1 `search` — the canonical lead database
+Owns 11 tables — the master record of **companies and contacts**: `lead_company`, `lead_contact`,
+plus enrichment (`apollo_company_data/contact_data`), organization (`lead_list`, `lead_note`,
+`lead_query`), and **activity timelines** (`lead_company_event`, `lead_contact_event`).
+
+Key concepts:
+- **Apollo-backed enrichment.** Lead data is sourced/enriched from Apollo; raw responses are stored
+  then mapped. (Apollo is disabled in dev — `apollo.enabled: false`.)
+- **`LeadFilterCriteria`** — the most-imported public type in the whole codebase. It's the structured
+  filter (industry, size, title, location, tech, …) used to define an audience. When you "search
+  leads" or "target a campaign," you're building a `LeadFilterCriteria`.
+- **Data-pack gating.** Which leads a tenant may even *see/target* is controlled by admin-owned
+  access policy (`DataPackGate`, a JPA `Specification`). Search doesn't re-implement the policy — it
+  *asks admin* for the gating spec (`AdminModule.buildDataPackGateSpecification`) and applies it. This
+  is a clean example of the facade rule: policy lives in `admin`, `search` consumes it.
+- **The lead timeline.** `search` is a big **event *listener*** — it reacts to campaign/outreach/
+  tracking events (`CampaignLaunchedEvent`, `CampaignEmailSentEvent`, `ReplyReceivedEvent`, …) by
+  writing `lead_contact_event` rows. So a contact's timeline ("emailed step 1", "replied") is
+  assembled passively from events fired by the other three modules.
+
+## 4.2 `campaign` — the plan (the most complex module)
+Owns `campaign`, `campaign_contact`, `campaign_email` (the sequence steps), `contact_email` (one-off
+sends), `sequence_template`, `timezone_mapping`, `campaign_chat_memory`.
+
+**Three status machines you must know:**
+- **Campaign:** `DRAFT → PENDING_APPROVAL → APPROVED → RUNNING ⇄ PAUSED → COMPLETED`. Auto-completes
+  when no ACTIVE/PENDING contacts remain.
+- **Campaign contact** (a lead enrolled in a campaign): `PENDING → ACTIVE → COMPLETED` (or `UNSUBSCRIBED`/`BOUNCED`).
+- **Email step:** `PENDING/RUNNING/PAUSED/COMPLETED`. Default sequence = **3 steps, delays 0 / 3 / 4 days**.
+
+**The rule that surprises people — templates are COPIED, not referenced:**
+> At launch, the immutable `EmailSequenceTemplate` steps are **copied** into mutable `CampaignEmail`
+> rows on the campaign. Editing a template later **does not** change a running campaign.
+This is deliberate: a launched campaign is a frozen snapshot, so template edits can't retroactively
+change what in-flight recipients get.
+
+**Timezone-aware sending windows.** A campaign has a sending window (e.g. Tue–Thu, 9am–5pm in the
+*recipient's* timezone). `ContactTimezoneResolver` + `timezone_mapping` resolve each contact's IANA
+timezone (from state→country), and `nextValidSendTime(...)` snaps a send to the next open slot. This
+is why outreach asks campaign "when may I next send this?" rather than deciding itself.
+
+**Mail-merge + the mail-guard** live here too (`MailMergeService`) — placeholder substitution
+(`{firstName}`, `{companyName}`) and the dev "redirect all mail to one inbox" guard you made
+configurable earlier.
+
+(Also here: the two AI services — `CampaignGeneratorService`, `CampaignAgentService` — that build
+campaigns from a chat prompt. They're the two documented `SpringAiClient` boundary bypasses, ISSUES.md A1.)
+
+## 4.3 `outreach` — the send engine (highest operational risk)
+**Owns no tables.** It's *stateless* — pure orchestration over campaign/tracking/workspace data. Its
+heart is one class: `CampaignOrchestratorService`.
+
+**The send cron:**
+```java
+@ConditionalOnProperty(name = "app.outreach.scheduler.enabled", havingValue="true", matchIfMissing=true) // ON by default
+@Scheduled(cron = "${campaign.orchestration.scheduler.cron}")   // "0 * * * * MON-FRI" = every minute, weekdays
+public void campaignEmailOrchestrator() {
+    campaignModule.getTopCampaignContactToMail()          // ← exactly ONE contact
+        .ifPresent(this::processCampaignContact);
+}
+```
+
+**The 5 ordered guards** (each *delays* the contact rather than dropping it) — this is the core
+business logic of sending:
+1. **Previous step still ongoing?** (`campaignModule.isCurrentStepOngoing`) → delay by the email's `delayDays`.
+2. **Contact eligible?** (`trackingModule.validateContactEligibility`) → not unsubscribed/bounced/throttled → else +1 day.
+3. **Mailbox token expired?** → +1 day (until the user re-auths their Gmail/Outlook).
+4. **Daily send limit hit?** (`emailsSentToday >= workspace.dailySendLimit`, default 30) → +1 day.
+5. **Outside the sending window?** → snap `nextSendAt` to `campaignModule.nextValidSendTime(...)`.
+
+If all pass → send, advance `currentStep`/`nextSendAt` (or mark COMPLETED), and **publish
+`CampaignEmailSentEvent`**.
+
+**Provider routing** (`sendCampaignEmail`): if `tenant.mailgunDomain` matches the mailbox domain →
+**Mailgun**; else `switch(mailbox.type)` → **GMAIL / OUTLOOK / SES / SMTP**. Each provider service
+sends through the *tenant's own connected mailbox* (OAuth tokens live in workspace's `mailbox` table)
+and appends the unsubscribe footer.
+
+> **⚠️ Scale bottleneck (ISSUES.md A5):** the cron sends **one email per tick, once a minute, weekdays
+> only** → a hard **global** ceiling of ~**1 email/minute (~1,440/day) for the *entire platform*,
+> across all tenants and campaigns combined.** For a mass-outreach product that's a serious throughput
+> limit — worth understanding before you reason about capacity.
+
+## 4.4 `tracking` — the feedback loop
+Owns one table: `contact_outreach_status` (note `current_campaign_ids` is a native Postgres
+`varchar[]`). Status enum `GlobalOutreachStatus`: `ACTIVE, PAUSED, COMPLETED, BOUNCED, UNSUBSCRIBED,
+CONVERTED`.
+
+**Eligibility** (`validateContactEligibility`, called by outreach guard #2):
+- no email → ineligible; `BOUNCED`/`UNSUBSCRIBED` → ineligible;
+- `ACTIVE` → if it's a **follow-up step** of the same campaign, bypass the throttle; else respect
+  `last-email-throttle-days` (**7**);
+- `COMPLETED` → respect `sequence-cooldown-days` (**90**).
+
+**Reply & bounce detection** (`AbstractReplySyncService`, Gmail + Azure variants; own cron):
+- Pages recently-SENT campaign contacts, fetches each email's thread/conversation (via
+  `OutreachModule.getGmailThread` / `getAzureConversation` — so tracking doesn't hold provider
+  clients), inspects later messages.
+- A later message `From` == an original `To` recipient → **reply** → mark `REPLIED`, publish `ReplyReceivedEvent`.
+- A mailer-daemon bounce → mark `BOUNCED`, publish `CampaignEmailBouncedEvent`.
+
+**Unsubscribe is TENANT-WIDE**, not per-campaign: `GET /v1/unsubscribe?token=…` sets the contact
+`UNSUBSCRIBED` across the whole tenant and publishes `ContactUnsubscribedEvent`. One unsubscribe stops
+*all* outreach to that person for that tenant. (This is the flow you fixed the redirect link for.)
+
+**Subtle boundary note:** tracking flips the campaign contact `Sent → REPLIED` by calling
+`campaignModule.saveCampaignContact(...)` (through the facade — allowed) *and* publishes the event for
+search's timeline. So a "reply" updates two modules, both via legal channels.
+
+## 4.5 The event nervous system (how the 4 stages actually stay in sync)
+The facades are the *pulls*; these events are the *pushes* that keep the pipeline coherent without
+tight coupling:
+```
+campaign  ──CampaignLaunchedEvent──▶  tracking (register contacts) + search (timeline)
+outreach  ──CampaignEmailSentEvent─▶  tracking (status) + workspace (mailbox counter) + search (timeline)
+tracking  ──ReplyReceivedEvent─────▶  search (timeline)          [+ flips campaign contact via facade]
+tracking  ──ContactUnsubscribedEvent▶ campaign (exclude contact)
+tracking  ──CampaignEmailBouncedEvent▶ campaign (mark bounced)
+campaign  ──CampaignCompletedEvent──▶ tracking (close out)
+```
+Notice **outreach listens to nothing** — it's a pure orchestrator/producer. And **search listens to
+almost everything** — it's the passive timeline-builder. That asymmetry is the shape of the engine.
+
+## Takeaways from Step 4
+1. **Assembly line:** `search` (lead data) → `campaign` (the plan: sequences, windows, statuses) →
+   `outreach` (the stateless send cron + 5 guards) → `tracking` (eligibility + reply/bounce/unsub).
+2. **Templates are copied at launch**, not referenced — a running campaign is a frozen snapshot.
+3. **Sends go through the tenant's own mailbox**, gated by 5 guards, one contact per minute — a real
+   global throughput ceiling (A5).
+4. **Unsubscribe is tenant-wide**, and the four stages stay in sync via **ID-only events**, with
+   `search` as the passive timeline-builder and `outreach` as a pure producer.
