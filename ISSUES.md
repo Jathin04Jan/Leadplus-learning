@@ -23,6 +23,7 @@ A living log of problems, risks, and gaps found in the LeadPlus platform while l
 | D4 | **Soft-delete via `active boolean`** — every query must remember `WHERE active = true`; forgetting it is a classic bug; makes unique constraints awkward. | 🟡 | 🔵 | Pattern-wide (lead_company, lead_contact, rfq, vendor, …). |
 | D5 | **Denormalized JSONB/`text` columns** for embedded objects (`email_data`, address/answers/lead-filter JSON converters) — lose queryability/indexability on contents; can't constrain. | 🟡 | 🔵 | Pragmatic (Mongo heritage); fine for read-mostly blobs. |
 | D6 | **Postgres array columns** (`varchar[]` for segments/tags/keywords) — non-standard, portability tax (H2 rejected `varchar[]` during the boot smoke test). | 🟡 | 🔵 | Works on Postgres; a friction point for tests/other engines. |
+| D7 | **The lead pool is a SHARED, cross-tenant global table** — `lead_company`/`lead_contact` use a `tenant_ids` **array** (not a per-tenant `tenant_id`); one person/company row is stored once and shared across tenants. Efficient (Apollo credits amortized — fetch once, all tenants benefit), but **tenant isolation for leads relies 100% on the data-pack gating `Specification` being applied on every query** (ties to S6). One query missing the gate spec → a tenant sees the whole global pool. Also a **data-governance** consideration: one tenant's Apollo-sourced PII is physically in a table other tenants query (separated by policy, not storage). | 🟠 | 🔵 | `leadgen/search/model/LeadContact.java`/`LeadCompany.java` (`tenantIds`); `TenantLeadService` (gate spec). Confirm this is contractually/GDPR-acceptable. |
 
 ## 2. Security & correctness (from full-codebase audit; mostly un-ticketed)
 
@@ -83,6 +84,14 @@ A living log of problems, risks, and gaps found in the LeadPlus platform while l
 | AI2 | **Prompts/templates loaded at static class-init** — 5 classes do `static final String X = FileReader.readFileContentFromClasspath("…")`. Any missing/misnamed resource throws `ExceptionInInitializerError` and **crashes the whole app at startup** with a cryptic error (not a clean message). This is exactly what caused boot failure `M3`. | 🟠 | 🔵 | `ChatService`, `LeadChatService`, `ContactEmailAiService`, `EmailPreviewService` (×2). Move to `@PostConstruct`/lazy with a clear error message. |
 | AI3 | **`MessageController.getConversations` hardcodes `MessageType.CAMPAIGN_AGENT`** — a generically-named "get conversations" endpoint only ever returns campaign-agent conversations; it's really a campaign-agent query mislabeled as generic. | 🟡 | 🔵 | `shared/ai/controller/MessageController.java` |
 | AI4 | **Dead AI-disable flags + illusory graceful degradation.** `spring.spring-ai.enabled: false` and `app.spring-ai.enabled: false` are in `application.yml` but **read by no code** (dead flags). The AI beans are **unconditional** `@Component`s, so `Optional<SpringAiClient>` is never empty → `AIServicesModule.getChatCompletion`'s `.orElse(null)` ("returns null when AI not configured") is **unreachable dead code** and its javadoc is wrong. Real behavior: AI is **always on**; with the dummy staging key, AI feature calls **throw a 401 at runtime** instead of degrading. There is effectively **no working kill-switch for AI**, contrary to what the config implies. | 🟠 | 🔵 | `shared/ai/AIServicesModule.java`, `SpringAiClient.java`, `application.yml`. Note `parseVendorSearchQuery` *throws* when unavailable while `getChatCompletion` *returns null* — inconsistent, and the null path can't actually trigger. Related: A1. |
+
+---
+
+## Pending work / to-verify (tasks, not defects)
+
+| # | Task | Notes |
+|---|------|-------|
+| P1 | **Verify + enable the Apollo integration in Corelabs** | Apollo is 100% dormant (`apollo.enabled: false`, empty `apiKey`, not set in `deploy.yml` → never run in dev/test/prod) and went through the modular refactor. **Just pasting a key won't work** — must also set `apollo.enabled: true`. Two-stage test needed: **(1)** boot with `apollo.enabled=true` + a dummy key to confirm the 9 conditional Apollo beans wire up (no latent dormant-code bug); **(2)** with a real key, exercise `POST /v1/companies/{idOrDomain}/sync/apollo` to confirm Apollo's live API contract + key plan still work. Related: AI4/M-pattern (compiles but untested when activated). |
 
 ---
 
