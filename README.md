@@ -16,7 +16,7 @@ depth; read it, ask follow-ups, then advance to the next.
 
 1. **Big picture** — domain, deployables, tech stack, architectural style, an end-to-end request trace ✅
 2. **Modular-monolith architecture** — the 11 modules, the `*Module` facade pattern, the boundary rule & enforcement, events, cycle resolution ✅
-3. **Identity & multi-tenancy** — `auth` (JWT/login/signup/OAuth) + `workspace` (tenant→workspace→user); how a request is authenticated and scoped
+3. **Identity & multi-tenancy** — `auth` (JWT/login/signup/OAuth) + `workspace` (tenant→workspace→user); how a request is authenticated and scoped ✅
 4. **The LeadGen engine** — `search → campaign → outreach → tracking` (leads, sequences, the send cron, reply/bounce/unsubscribe)
 5. **The RFQ marketplace** — `buyer / vendor / rfq` (onboarding, RFQ→quotation lifecycle, collaborators)
 6. **The AI module** — how all AI funnels through `AIServicesModule`, prompts, chat memory, the Python-extraction seam
@@ -272,3 +272,147 @@ maintain today *are* the future service boundaries.
    matters because compile-green didn't guarantee boot.
 4. This structure exists to make the **future extraction** (AI → Python, and beyond) a boundary
    already drawn.
+
+---
+
+# Step 3 — Identity & multi-tenancy
+
+Everything in the app is scoped to a tenant, and every request carries an identity. Two modules own
+this: **`shared/workspace`** (the *who* and *where* — tenants, workspaces, users) and **`auth`**
+(the *proof* — tokens, login, signup). Understanding the split between them, and how a request gets
+authenticated and scoped, is the key to reading any controller in the codebase.
+
+## 3.1 The tenancy data model — `tenant → workspace → user`
+All of this is owned by **`shared/workspace`** (it owns 16 tables; these are the identity core):
+
+```
+Tenant (table: tenant)                     one customer/organization
+  ├─ ownerId → User                        who created it
+  ├─ modules: List<Module>                 which product halves this tenant sees  ← gates the UI
+  └─ 1───N Workspace (table: workspace)    sub-spaces within a tenant (teams/brands)
+                └─ dailySendLimit, cc/bcc defaults, ...
+
+User (entity: User, table: **tenant_user**)   a person   ← note: table is tenant_user, NOT "users"
+  ├─ tenantId    → their home tenant
+  ├─ workspaceId → their home workspace
+  ├─ roles: List<UserRole>   (CUSTOMER, VENDOR, GUEST, USER, ADMIN, TENANT_OWNER)
+  ├─ status, verification tokens, identityProviders (JSON)
+
+WorkspaceUser (table: workspace_user)      the membership junction
+  └─ (tenantId, workspaceId, userId) + role (OWNER/MEMBER/WORKSPACE_ADMIN) + status (INVITED/ACCEPTED/REVOKED)
+```
+
+Two things to internalize:
+- **A user has a *home* workspace, but can be a *member* of many** via `workspace_user`. There are
+  therefore **two role notions**: the user's global `roles` (on `tenant_user`) and their per-workspace
+  role (on `workspace_user`). Don't confuse them.
+- **`tenant.modules`** is load-bearing: it's the text list that drives which half of the product
+  (LeadGen / RFQ marketplace) a tenant can access. The frontend's route-gating reads it too.
+- Remember from Step-1/data-layer: these are **plain `Long` FK columns, no JPA relationships, no DB
+  FKs**. You never traverse an object graph — you fetch by id through `WorkspaceModule`.
+
+## 3.2 The split: `auth` is a *leaf*, `workspace` owns identity
+This is a deliberate, and initially surprising, design decision:
+
+> **`auth` owns exactly ONE table: `refresh_token`.** Every bit of *user and credential state*
+> (email, password hash, roles, tenant, verification) lives in **`workspace`'s `tenant_user`** table.
+
+Why? To break the `auth ↔ workspace` cycle (Step 2). Auth needs users; workspace needs auth for
+identity. They made **auth the leaf**: auth knows nothing about tenants, and reads user/credential
+data *out of* workspace via `WorkspaceModule` (injected `@Lazy` to break the constructor cycle).
+Identity crosses the boundary as **auth-owned DTOs** — `AuthUserView`, `AuthCredentials`,
+`SignupCommand` — that workspace populates. So workspace never leaks its `User` entity into auth.
+
+A nice security consequence: `AuthModule.requireRole(userId, role)` **re-loads roles from workspace's
+live record**, not from the (possibly stale) token — so revoking a role takes effect immediately.
+
+## 3.3 What `auth` actually does — and where login *really* lives
+`AuthModule` (the leaf's public surface) is tiny — just 4 methods:
+```java
+getGoogleUserInfo(accessToken)   // resolve a Google profile (used by mailbox connect)
+validateToken(token)             // signature + expiry check
+getUserFromToken(token)          // extract userId
+requireRole(userId, role)        // authorize against LIVE workspace roles
+```
+
+`AuthController` (`/v1/auth`, all public) handles: **sign-up**, **sign-up/vendor**, **refresh**,
+**forgot-password (request + reset)**, **Google OAuth**, **verify-email**.
+
+**The surprise:** **username/password *login* is NOT in the auth module.** It lives in the bootstrap
+layer at `api/configurations/JwtAuthenticationFilter` — a Spring Security filter wired to
+`POST /v1/auth/login`:
+```java
+jwtAuthenticationFilter.setFilterProcessesUrl("/v1/auth/login");
+```
+So if you go looking for "the login code" in `auth/`, you won't find it — it's a security filter in
+`api/configurations/`. (This is a legitimate Spring-Security pattern, but it trips people up.)
+
+## 3.4 The JWT — what's in the token
+On successful login/refresh, `JwtService` mints an **HS-signed** access token whose claims are
+(verified in `JwtService.generateToken`):
+```
+userId · workspaceId · tenantId · name · email · roles(List) · verified · active
+```
+That's the whole point: **the token carries the tenant + workspace + roles**, so downstream code
+knows *who* and *which tenant* without a DB hit. Two tokens exist:
+- **Access token** — short-ish lived, sent as `Authorization: Bearer …` on every request.
+- **Refresh token** — the only thing `auth` persists (`refresh_token` table); used at
+  `POST /v1/auth/refresh` to mint a new access token (re-reading fresh state from workspace).
+
+## 3.5 The request lifecycle — how a request is authenticated
+Security is **stateless** (no server sessions). There are **three `SecurityFilterChain`s**
+(`SecurityConfiguration.java`), matched by URL:
+
+1. **`/v1/facts/**`** → API-key chain (`ApiKeyAuthenticationFilter`) — system-to-system; `X-API-KEY` **or** `ROLE_ADMIN`.
+2. **`/v1/companies/**`, `/v1/contacts/**`** → a *second* API-key chain (a different lead-ingest key) **or** `ROLE_ADMIN`.
+3. **Everything else** → the default JWT chain. This is the one you care about 99% of the time:
+   - `permitAll` list: `/v1/auth/**`, `/v1/unsubscribe`, swagger, `/v1/chat`, `/v1/tenants/modules`, public catalog (`/v1/services|industries|specifications`), `/v1/vendors/search`, etc.
+   - `/v1/admin/**` + `/v1/prompt-specifications/**` → `hasRole("ADMIN")`.
+   - `anyRequest()` → `hasAnyRole("CUSTOMER","VENDOR","GUEST","USER","ADMIN")`.
+
+Per request, **`JwtAuthorizationFilter`** (extends `BasicAuthenticationFilter`):
+- **No `Bearer` header** → treated as a **guest**: assigns/echoes an `X-Guest-Id` and continues (this is how the public marketplace / anonymous chat work).
+- **With a token** → validate signature+expiry, check the `active` claim (403 if false), build the `SecurityContext` from the token. Malformed/expired → 401.
+
+## 3.6 How multi-tenancy is *enforced* — and the gap
+Two mechanisms, both **manual**:
+1. **Path convention:** almost every endpoint is `\/v1/tenants/{tenantId}/workspaces/{workspaceId}/…`.
+   The tenant/workspace are **in the URL**, not inferred from the token.
+2. **Validators** (the allowlisted `shared/workspace/controller/common` classes — `TenantValidator`,
+   `WorkspaceValidator`, `UserValidator`): a controller calls e.g. `tenantValidator.validate…()` to
+   check the **authenticated user (from the token) actually belongs to the tenant/workspace in the path**.
+
+**⚠️ The architectural gap (important):** tenant isolation is **entirely developer-discipline**. There
+is **no automatic enforcement** — no Hibernate tenant filter, no Postgres row-level security, no
+interceptor that injects `WHERE tenant_id = ?`. If a controller **forgets** to call the validator, or
+a query forgets to filter by `tenantId`, you get **cross-tenant data access**. This is exactly the
+root of the IDOR findings (ISSUES.md S1/S2) — and it's why we added **S6** during this step:
+*multi-tenant isolation has no framework/DB safety net.* On a no-FK, manually-scoped schema, tenant
+data separation rests on every developer remembering to scope every query. Treat that as a first-class
+risk.
+
+## 3.7 Signup provisioning — one call sets up a whole tenant
+When a user signs up, a single synchronous flow provisions everything (kept synchronous *because the
+JWT needs `tenantId`/`workspaceId` immediately):
+```
+POST /v1/auth/sign-up
+  → auth: RefreshTokenService.createUser(SignupCommand)
+      → workspace: WorkspaceModule.createUser(cmd)   // one transactional call
+          ├─ create Tenant (owner = this user)
+          ├─ create the user's home Workspace
+          ├─ create the User (tenant_user) with roles
+          └─ create the WorkspaceUser (OWNER membership)
+      ← returns AuthUserView (auth-owned DTO)
+  → mint access + refresh tokens (tenantId/workspaceId now known)
+```
+Vendor signup is similar but also publishes a `VendorUserRegisteredEvent`, which the **vendor** module
+listens for to create the vendor row (Step-2's event pattern in action).
+
+## Takeaways from Step 3
+1. **`workspace` owns identity** (tenant→workspace→user, table `tenant_user`); **`auth` is a leaf**
+   owning only `refresh_token` and reading users via `WorkspaceModule`.
+2. **Login lives in a bootstrap security filter** (`api/configurations/JwtAuthenticationFilter`), not
+   in the `auth` module. Signup/refresh/OAuth/reset are in `AuthController`.
+3. The **JWT carries `tenantId`+`workspaceId`+`roles`** → stateless auth; refresh re-reads live state.
+4. Multi-tenancy is enforced by **URL path + validators, manually** — there's **no automatic tenant
+   isolation** (no RLS/Hibernate filter), which is a first-class risk (ISSUES.md S6).
