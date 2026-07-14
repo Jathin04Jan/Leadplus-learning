@@ -70,6 +70,17 @@ Migrated code in `search`, `campaign`, and `admin` reached **directly into other
 
 ---
 
+## Residual items from the migration (not build-breaking, but left behind)
+| Item | Detail | Suggested action |
+|------|--------|------------------|
+| **Unused Anthropic dependency** | The migration added `spring-ai-starter-model-anthropic` + `spring.ai.anthropic.api-key` (part of the "Agent Factory" deps), but **no code uses Anthropic** — all AI runs on OpenAI. It auto-configures an `anthropicApi` bean that *requires* a key at startup (this caused defect M4). We added a dummy key to unblock boot, so it's carrying a mandatory secret for a feature that doesn't exist. | Remove the dependency until Agent Factory actually lands, or disable its auto-config. |
+| **Other Agent-Factory deps unused** | `slack bolt-socket-mode`, `javaparser`, `jgit`, plus the SonarCloud / OWASP-dependency-check plugins were added in the same setup commit but have no feature code behind them yet. | Confirm they're intended scaffolding; otherwise trim to reduce attack surface / build weight. |
+
+**Everything in sections A–F above is fixed** (`main` compiles, all tests + boundary test pass, boots
+on PostgreSQL in `validate` mode). The two residual items above are follow-ups, not blockers.
+
+---
+
 ## Summary checklist for future Limark→Corelabs migrations
 When porting a feature from Limark into the modular codebase, verify **all** of these before opening the PR:
 1. **Imports updated** to the modular package locations (not the old `infrastructure.*` / `api.common.*` paths).

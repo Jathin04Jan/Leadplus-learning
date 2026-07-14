@@ -39,6 +39,7 @@ Gradle / PostgreSQL (JPA).
 | **Secrets committed to source control** | `application.yml`: `jwt.secret: 23a50ad6…` (a real signing secret) hardcoded; also `PRODUCTION_MIGRATION_READY.md` contains prod-looking DB credentials | Anyone with repo access can forge JWTs / reach prod. Secrets belong in env/secret-manager, and any leaked ones must be rotated. |
 | **Dead / misleading auth code** | `JwtService` reads a **`"role"` (singular)** claim that is never written (2 refs) → the role-extraction path is always empty/dead | Suggests role handling that doesn't actually work; a maintenance and correctness trap. |
 | **Shared cross-tenant lead pool + a null-tenant leak** | `lead_company`/`lead_contact` are a **single global table** shared across tenants via a `tenant_ids` **array** (not per-tenant rows). Access is filtered only in queries as `WHERE (tenant_ids IS NULL OR tenant_ids @> ARRAY[:tenantId])` — so **any row with `tenant_ids IS NULL` is visible to *every* tenant**, and any query that forgets the filter exposes the whole pool | Tenant isolation for leads rests entirely on remembering the filter (no per-tenant storage, no DB-level enforcement); the `NULL`-visible-to-all rule is an active leak. Also a **data-governance/PII** concern — one tenant's sourced person data physically sits in a table others query. |
+| **No framework/DB-level tenant isolation anywhere** | Verified: **0** Hibernate `@Filter`/`@FilterDef`, **0** Postgres row-level security, **0** tenant interceptors/aspects. **Every** tenant-scoped query must manually add `WHERE tenant_id = …` (and every object-scoped controller must manually validate) | Multi-tenant data separation is 100% developer discipline with no safety net — the systemic root behind both the IDOR findings and the lead-pool leak above. One forgotten scope = cross-tenant exposure. |
 
 **Direction:** apply a consistent ownership/authorization check (a shared validator) to *every*
 object-scoped endpoint; move all secrets to env/secret-manager and rotate; remove the dead role path;
@@ -84,6 +85,16 @@ Spring Modulith), so cross-feature access goes through explicit interfaces rathe
 | **Stale, misleading docs** | `CONTRIBUTING.md`, `docs/MONGODB_INDEXES.md`, `docs/QUERY_OPTIMIZATION.md` all describe a **MongoDB** (and Maven/older-Java) world, while the app actually runs on **PostgreSQL / JPA / Gradle** | New engineers are actively misled about the datastore, build tool, and setup — a real onboarding trap. |
 
 **Direction:** delete or clearly archive the Mongo-era docs; keep a single accurate CONTRIBUTING/run guide.
+
+## 8. Scalability & operations
+
+| Finding | Evidence | Why it matters |
+|---------|----------|----------------|
+| **Email send throughput capped at ~1/minute — globally** | `CampaignOrchestratorService.campaignEmailOrchestrator` fetches and sends **exactly one** contact per tick (`getTopCampaignContactToMail()` → `Optional`), on a `0 * * * * MON-FRI` schedule | The **entire platform** (all tenants, all campaigns) sends at most ~1 email/minute (~1,440/day, weekdays only) through a single serial global queue — no batching, no per-tenant parallelism/fairness. A hard scale wall for a mass-outreach product. |
+| **No open/click tracking despite the enum implying it** | `OPENED`/`EMAIL_OPENED` delivery states exist but nothing populates them (no tracking pixel / click-redirect) | "Open/click rate" analytics have no real data (see §4). |
+
+**Direction:** batch multiple contacts per tick and parallelize per mailbox/tenant (respecting each
+mailbox's daily limit); if open/click metrics are a product goal, implement pixel/redirect tracking.
 
 ---
 
