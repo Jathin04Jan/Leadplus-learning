@@ -18,7 +18,7 @@ depth; read it, ask follow-ups, then advance to the next.
 2. **Modular-monolith architecture** — the 11 modules, the `*Module` facade pattern, the boundary rule & enforcement, events, cycle resolution ✅
 3. **Identity & multi-tenancy** — `auth` (JWT/login/signup/OAuth) + `workspace` (tenant→workspace→user); how a request is authenticated and scoped ✅
 4. **The LeadGen engine** — `search → campaign → outreach → tracking` (leads, sequences, the send cron, reply/bounce/unsubscribe) ✅
-5. **The RFQ marketplace** — `buyer / vendor / rfq` (onboarding, RFQ→quotation lifecycle, collaborators)
+5. **The RFQ marketplace** — `buyer / vendor / rfq` (onboarding, RFQ→quotation lifecycle, collaborators) ✅
 6. **The AI module** — how all AI funnels through `AIServicesModule`, prompts, chat memory, the Python-extraction seam
 7. **Cross-cutting** — security filter chains, exceptions, timezones, events, schedulers, S3/email infra
 8. **The frontend** — Next.js structure, token/auth flow, module gating, the data-fetching pattern
@@ -597,3 +597,145 @@ almost everything** — it's the passive timeline-builder. That asymmetry is the
    global throughput ceiling (A5).
 4. **Unsubscribe is tenant-wide**, and the four stages stay in sync via **ID-only events**, with
    `search` as the passive timeline-builder and `outreach` as a pure producer.
+
+---
+
+# Step 5 — The RFQ marketplace (`buyer / vendor / rfq`)
+
+The *other* half of the product — completely separate from the LeadGen engine. It's a **two-sided
+marketplace**: **buyers** discover **vendors** and send them **RFQs** (requests for quote); vendors
+respond with **quotations**. Three modules, plus heavy reliance on `admin` (the service/industry
+catalog + agreement templates) and `workspace` (users, emails, attachments).
+
+## 5.0 The actual dependency graph (verify code, not the docs)
+```
+        buyer ─────▶ vendor ─────▶ admin, workspace
+          │            ▲
+          └────────────┤
+        rfq ───────────┘──────────▶ admin, workspace
+       (+ ai for NL search)
+```
+Verified from imports:
+- **buyer** → `VendorModule`, `AIServicesModule`
+- **rfq** → `VendorModule`, `AdminModule`, `WorkspaceModule`
+- **vendor** → `AdminModule`, `WorkspaceModule`
+
+So within the trio, **`vendor` is the most depended-upon** (both buyer and rfq call it), and there
+are **no cycles**. ⚠️ **Doc drift to note:** `rfq/CONTEXT.md` says *"depends on auth ONLY; rfq is the
+leaf."* That's **false** in the code — `rfq` depends on `vendor` + `admin` + `workspace`. What's
+*true* is the narrower claim that **buyer/vendor context is passed into rfq as parameters** (rfq never
+calls *back* into buyer), which is how the buyer↔rfq cycle was avoided. (Logged: ISSUES.md X5.)
+
+## 5.1 Who owns what
+| Module | Owns (tables) | Role |
+|--------|---------------|------|
+| **`vendor`** | `vendor`, `vendor_showcase`, `vendor_agreement` | The supplier side: profile, portfolio, signed agreements |
+| **`rfq`** | `request_for_quote`, `request_for_proposal`, `quotation`, `collaborator` | The transaction: requests, responses, teams |
+| **`buyer`** | **nothing** | A thin edge module — just `VendorSearchController` over `VendorModule` + `AIServicesModule` (Step-2's "edge module, no tables" archetype) |
+
+The **`vendor`** entity is a big denormalized profile: `industryIds/serviceIds/specificationIds`
+(arrays of catalog ids validated against `admin`), `certifications`, `regionsCovered`, client-fit
+arrays (`clientBudgets/Sizes/Industries/…`), plus JSONB-embedded `Address`, `SocialMedia`, and
+onboarding `Answer` list. Status = `VendorVerificationStatus { INCOMPLETE, PENDING, APPROVED, REJECTED }`.
+
+## 5.2 The vendor lifecycle (signup → approval → module enablement)
+```
+1. Vendor signup       auth: POST /v1/auth/sign-up/vendor → publishes VendorUserRegisteredEvent (IDs only)
+2. Vendor row created  vendor: @EventListener handleVendorUserRegistered → createVendorFromUser(...)
+                              → adminModule.assignSoftwareDataPackToVendor(...)   (gives them a starter data pack)
+                       status = INCOMPLETE
+3. Onboarding          vendor fills the profile (4-step wizard in the UI); catalog ids validated via AdminModule
+4. Submit for review   PUT /v1/users/me/vendor/pending → updateVendorToPending → status = PENDING
+5. Admin approval      admin console → AdminVendorController → vendorModule.updateVendorStatus(id, APPROVED)
+                              ├─ workspaceModule.sendVendorApprovedEmail(...)
+                              └─ workspaceModule.enableVendorModules(tenantId)   ← unlocks the vendor UI for the tenant
+                       status = APPROVED   (or REJECTED with a review comment + rejection email)
+```
+Two things worth noting:
+- **Approval is a cross-module *direct call*, not an event** — `updateVendorStatus(APPROVED)` calls
+  `WorkspaceModule.enableVendorModules(tenantId)` synchronously. (A legacy `VendorApprovedEvent` file
+  still lingers but the direct call is what's used.)
+- **Only `APPROVED` vendors are ever visible to buyers** (enforced in `VendorService.searchVendors`).
+
+## 5.3 Vendor agreement signing — the OTP flow
+Vendors must sign agreements (Privacy Policy, Terms of Service) before/while operating. The
+**templates & versions live in `admin`** (the `agreement` table, `AgreementType {PRIVACY_POLICY,
+TERMS_OF_SERVICE}`); the **signed instance + OTP state lives in `vendor`** (`vendor_agreement`).
+
+```
+GET  /v1/vendor-agreements/{vendorId}?agreementType=…   → render agreement (adminModule.getLatestAgreementByType
+                                                           + {{PLACEHOLDER}} substitution: NAME/EMAIL/COMPANY/…)
+POST /v1/vendor-agreements/otp        → sendOTPToVendor: 6-digit SecureRandom, emailed via WorkspaceModule;
+                                        90s resend throttle (OtpResendTooSoonException)
+POST /v1/vendor-agreements/verify-otp → verifyVendorOTP: max 3 attempts, 1-hour expiry, single-use → mark signed
+```
+Each call first does `validateAuthenticatedVendorId(vendorId)` (ownership-checked — unlike the
+showcase controller, see §5.7). Agreements are **versioned**: if admin's latest version differs from
+what the vendor signed, they're re-prompted.
+
+## 5.4 The buyer side — vendor discovery
+`buyer` is just `VendorSearchController` (`/v1/vendors`), 3 endpoints:
+- **`POST /search`** — filtered vendor search (industry/service/spec/certs) via `VendorModule.searchVendors`.
+  Public/anonymous is supported but **capped + anonymized**: logged-out callers get `PageRequest.of(0, 5)`
+  and a `VendorDetailResponse::fromDtoToAnonymous` projection (name/contact hidden) — a teaser to drive signup.
+- **`POST /search/parse`** — natural-language → structured filters via `AIServicesModule.parseVendorSearchQuery`
+  (the `vendor-query-parser` prompt; the *only* real AI-module method exposed as a facade call).
+- **`GET /{vendorId}`** — the public vendor profile.
+
+> ⚠️ Not built: the CONTEXT lists a full **"AI Sourcing Assistant"** chat as buyer-owned, but only the
+> `search/parse` NL-parse exists — the assistant itself was never implemented (known gap).
+
+## 5.5 The RFQ lifecycle (the transactional core)
+```
+POST /v1/request-for-quotes                       buyer creates an RFQ
+  RequestForQuoteService.createRFQ:
+    ├─ adminModule.validateServiceIds(serviceIds)      // catalog validation
+    ├─ vendorModule.validateVendorIds(vendorIds)       // the invited vendors exist
+    ├─ status = OPEN
+    ├─ collaboratorService.createOwner(rfqId, REQUEST_FOR_QUOTE, userId)   // creator = OWNER
+    └─ for each vendorId: publishEvent( CreateRequestForQuoteEvent(rfqDto, vendorId) )   // fan-out
+
+  QuotationService.handleCreateRequestForQuoteEvent   @Async @TransactionalEventListener
+    └─ per invited vendor: create a PENDING quotation "shell"   // so each vendor has a slot to fill
+```
+Then vendors respond (`QuotationRequestForQuoteController`, gated by `vendorValidator.getAuthenticatedVendor`):
+they fill their PENDING shell → `QuotationStatus { PENDING → QUOTED }`, and the buyer
+**accepts/rejects** → `ACCEPTED / REJECTED`. The RFQ itself is `RequestStatus { OPEN → CLOSED / CANCELLED }`.
+Quotation **items are a JSONB list** (`QuotationItemListConverter`), not a child table — so comparison
+is in-memory (Step-1's no-FK/embedded-JSON pattern).
+
+**RFP (Request For Proposal)** is the softer sibling ("propose an approach," not just price). It's
+**built on the backend** (12 endpoints: `RequestForProposalController` + collaborator + quotation
+controllers) but **stubbed in the UI** — the `customer/rfps` and `vendor/rfps` pages are `ComingSoon`.
+So RFP is dormant/half-shipped: API exists, no front-end.
+
+## 5.6 Collaborators — team access on a request
+Any RFQ/RFP can have collaborators (invite teammates to evaluate quotes together).
+`CollaboratorRole { OWNER, EDITOR, VIEWER, BD }`, with `CollaboratorValidator`:
+- **editorRoles** = {OWNER, EDITOR} · **viewerRoles** = {OWNER, EDITOR, VIEWER, BD}
+- `validateOwner / validateEditor / validateViewer` read the authenticated user's collaborator record
+  and gate the action. Invites go out as emails via `WorkspaceModule.sendCollaboratorInvite` with a
+  link built from `${client.url}`. (`BD` = a business-development role that can view but not edit.)
+
+## 5.7 The security gap you must know (verified live)
+The collaborator role checks exist **but are applied inconsistently**:
+- `RequestForQuoteCollaboratorController` (the collaborator sub-controller) **is** guarded (7 validation refs).
+- **`RequestForQuoteController`** — the *main* RFQ CRUD — has **8 mappings and 0** `CollaboratorValidator`
+  calls. So `GET/PUT/DELETE /request-for-quotes/{id}` and the attachment ops perform **no ownership/
+  collaborator check** → any authenticated user can read/modify/delete any RFQ by id (**IDOR**). Same
+  pattern on `CustomerQuotationController` and `VendorShowcaseController` (0 ownership checks).
+This is **ISSUES.md S1/S2** — the concrete instance of the S6 "no automatic tenant isolation" risk.
+
+## Takeaways from Step 5
+1. A **two-sided marketplace**: `vendor` (supplier profiles + agreements), `rfq` (RFQ→quotation
+   transaction + collaborators), `buyer` (a thin search edge, no tables). Real dep graph:
+   buyer→vendor, rfq→vendor, vendor→admin/workspace — **no cycles** (and the "rfq is auth-only leaf"
+   doc is wrong).
+2. **Vendor lifecycle:** `INCOMPLETE→PENDING→APPROVED` — admin approval is a **direct** call that
+   `enableVendorModules` + emails; only APPROVED vendors are buyer-visible.
+3. **Agreements** = admin-owned templates, vendor-owned signed instances, gated by a **6-digit OTP**
+   (90s throttle, 3 attempts, 1-hr expiry).
+4. **RFQ fan-out:** create → validate → per-vendor `CreateRequestForQuoteEvent` → auto `PENDING`
+   quotation per vendor → QUOTED → ACCEPTED/REJECTED. **RFP is backend-built but UI-stubbed.**
+5. **Security:** collaborator checks exist but the **main RFQ CRUD skips them (IDOR, S1)** — the
+   marketplace's headline risk.

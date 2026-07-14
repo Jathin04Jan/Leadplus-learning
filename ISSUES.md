@@ -65,6 +65,7 @@ A living log of problems, risks, and gaps found in the LeadPlus platform while l
 | X2 | Per-module `CONTEXT.md` files say the `*Module` facades are "Planned (Day 6–7)" — they're fully implemented. | 🟡 | 🔵 | Update CONTEXT.md files. |
 | X3 | `ModuleBoundariesTest` enforces **all 11 modules**; docs/CONTEXT still describe "5 strict / 8 backlog". Its exemption set is 4 adapters + 2 SpringAiClient files (docs say "5 + 2 = 7"). | 🟡 | 🔵 | `src/test/java/ai/leadplus/ModuleBoundariesTest.java` |
 | X4 | `Docs/RESUME-HERE.md` says Liquibase was re-enabled — it's **disabled**. | 🟡 | 🔵 | See D3. |
+| X5 | `rfq/CONTEXT.md` says the module *"depends on auth ONLY; rfq is the leaf"* — **false** in the code: `rfq` imports `VendorModule` + `AdminModule` + `WorkspaceModule`. The accurate (narrower) statement is that buyer/vendor context is passed *into* rfq as parameters (rfq never calls back into buyer), which is how the cycle was avoided. | 🟡 | 🔵 | `portal/rfq/CONTEXT.md` |
 
 ## 6. Architecture debt (known / tracked)
 
