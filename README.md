@@ -21,7 +21,7 @@ depth; read it, ask follow-ups, then advance to the next.
 5. **The RFQ marketplace** — `buyer / vendor / rfq` (onboarding, RFQ→quotation lifecycle, collaborators) ✅
 6. **The AI module** — how all AI funnels through `AIServicesModule`, prompts, chat memory, the Python-extraction seam ✅
 7. **Cross-cutting** — security filter chains, exceptions, timezones, events, schedulers, S3/email infra ✅
-8. **The frontend** — Next.js structure, token/auth flow, module gating, the data-fetching pattern
+8. **The frontend** — Next.js structure, token/auth flow, module gating, the data-fetching pattern ✅
 9. **Build / run / deploy** — Gradle, the `schema.sql` + `validate` model, CI/CD (jib→ECR→ECS), config & secrets
 10. **Migration context** — the modular-monolith refactor, phases, Java-now/Python-later, known issues
 
@@ -958,3 +958,97 @@ composition root.
 4. **Schedulers** all share the **cron + `enabled` kill-switch + manual trigger** shape (10 of them).
 5. **Infra** = S3 (via workspace), 5 email senders (+ `safeSend` for notifications), and the
    `domain/common` converters that power the JSONB/array columns.
+
+---
+
+# Step 8 — The frontend (`leadplus-portal`)
+
+Next.js 16 / React 19, **compiled to a static export** (`output: "export"`, `trailingSlash: true`) →
+plain HTML/JS on S3+CloudFront. Consequences that shape *everything*: **no server, no middleware, no
+API routes.** All auth, routing, and gating is **client-side**; all data comes from the backend over
+`${NEXT_PUBLIC_API_URL}/api` (the axios client appends `/api`).
+
+## 8.1 Structure — App Router route groups
+Under `src/app/`, organized by access level:
+- **`(auth)`** — `/login`, `/signup`, `/forgot-password`, `/password-reset`
+- **`(legal)`**, **`(page)`** — public/legal + email-verification pages
+- **`(redirect)`** — `/unsubscribe`, `/workspace-invite` (token landing pages)
+- **`(modules)`** — the product, four sub-trees: `admin`, `customer`, `leadgen`, `vendor` (each with a
+  `_config/navigationList.tsx` and an inner `(dashboard-protected)` group)
+
+`src/config/routes.ts` is the single route registry; `src/config/endpoints.ts` is the matching backend
+URL registry (almost all `/v1/tenants/{t}/workspaces/{w}/…`).
+
+## 8.2 Auth — the split-token model + axios refresh
+Two tiny modules hold the tokens (`src/lib/auth/`):
+- **`tokenManager.ts`** — the **access token in memory only** (a module variable; never persisted).
+- **`tokenStorage.ts`** — the **refresh token in `localStorage`** (key `token`).
+
+The axios client (`src/lib/api/client.ts`) does the rest:
+- **Request interceptor:** skips auth for `/login` + `/refresh`; else injects `Authorization: Bearer
+  <in-memory access token>` and an **`X-Timezone`** header (from `Intl.DateTimeFormat` — the input to
+  Step-7's timezone conversion).
+- **Response interceptor:** on **401**, calls `POST /v1/auth/refresh?refreshToken=…`, stores the new
+  access token in memory, and **replays** the original request. Concurrent 401s **queue behind a
+  single refresh** (`isRefreshing` + `failedQueue`) so you don't fire N refreshes. A failed refresh →
+  clear the refresh token → hard-redirect to `/login`.
+
+**`AuthContext`** is the session brain: on mount it reads the refresh token → mints an access token →
+`jwtDecode`s it into `loggedInUser` (`userId`, `tenantId`, `roles`, `verified`), loads `/v1/users/me`
++ `/v1/users/me/workspaces`, and exposes `login / logout / changeWorkspace`. The selected workspace id
+is persisted in `localStorage` (`CURRENT_WORKSPACE`) — **load-bearing**, since most endpoints are
+`/tenants/{t}/workspaces/{w}/…`.
+
+## 8.3 Route gating — 4 guards + the module map
+Because there's no server, gating is **layered client-side components**:
+1. **`AuthGuard`** — requires `loggedInUser`; unverified → `/email-verification`; optional `allowedRoles`.
+2. **`ModuleProtectedRoute`** — reads the tenant's **enabled modules** from `ModuleContext` (which
+   comes from `GET /v1/tenants/modules` = the backend's `tenant.modules`) and blocks routes for modules
+   the tenant doesn't have. `CUSTOMER` is a `publicModules` exception (the marketplace is browsable
+   anonymously).
+3. **`ProtectedRoute`** — like AuthGuard + loads the full `authenticatedUser`; PENDING/REJECTED users
+   are bounced to the profile-overview.
+4. **`VendorProtectedRoute`** — adds vendor-status gating (INCOMPLETE→onboarding, not-approved→
+   overview, unsigned agreements→agreements — the last currently feature-flagged off).
+
+So the tenant's `tenant.modules` field (Step 3) is what the whole navigation + access model keys off.
+
+## 8.4 The data-fetching pattern — one rigid 3-layer stack
+This is the single most repeated pattern in the frontend (~40 api modules paired with ~55 hooks):
+```
+src/lib/api/<x>.api.ts     axios call + handleAxiosError            (the transport)
+        ▼
+src/hooks/use<X>.ts         React Query useQuery / useMutation       (cache + invalidation)
+        ▼
+component                    calls the hook, renders                 (the UI)
+```
+- **Server state = TanStack React Query**, one client (`refetchOnWindowFocus: false`,
+  `refetchOnMount: false`, `retry: 1`). Query keys centralized in `config/queryKeys.ts`; mutations
+  invalidate the relevant keys.
+- **Client/UI state = React Context** — the provider nest (`providers.tsx`):
+  `BrandTheme → Theme → QueryClient → GoogleOAuth → Modal → Auth → AuthModal → Module → Chat`.
+- **URL as state** — detail views toggle on query params (`?id=`, `?listId=`, `?contact=`,
+  `?workspaceId=`) rather than dynamic route segments (a consequence of static export — no
+  server-rendered dynamic routes).
+
+Once you know this stack, every feature reads the same: find the `*.api.ts`, its `use*.ts` hook, and
+the page that calls it.
+
+## 8.5 How the frontend maps to the backend
+The four `(modules)` sub-trees map cleanly onto the backend areas:
+| Frontend area | Backend module(s) |
+|---------------|-------------------|
+| `leadgen/*` (search, lists, campaigns, generator/agent, outreach settings, resources) | `search`, `campaign`, `outreach`, `shared/ai`, `workspace` |
+| `customer/*` (marketplace, vendor search, RFQs) | `buyer`, `rfq` |
+| `vendor/*` (onboarding, profile, agreements, RFQ inbox) | `vendor`, `rfq` |
+| `admin/*` (companies/leads import, tenants, vendor approvals, catalog, prompts) | `shared/admin`, `shared/ai` |
+
+## Takeaways from Step 8
+1. **Static export → everything is client-side** (no server/middleware/API routes); data comes from
+   `${NEXT_PUBLIC_API_URL}/api`.
+2. **Split-token auth:** access token **in memory**, refresh token in **localStorage**; axios does
+   **refresh-on-401 with a single-flight queue**; `AuthContext` is the session brain.
+3. **4 layered guards** + `tenant.modules` (via `ModuleContext`) drive routing/nav; the selected
+   **workspace** is load-bearing.
+4. **One data-fetching stack everywhere:** `*.api.ts` → React Query `use*.ts` hook → component; URL
+   query params carry view state.
