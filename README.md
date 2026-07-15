@@ -22,7 +22,7 @@ depth; read it, ask follow-ups, then advance to the next.
 6. **The AI module** — how all AI funnels through `AIServicesModule`, prompts, chat memory, the Python-extraction seam ✅
 7. **Cross-cutting** — security filter chains, exceptions, timezones, events, schedulers, S3/email infra ✅
 8. **The frontend** — Next.js structure, token/auth flow, module gating, the data-fetching pattern ✅
-9. **Build / run / deploy** — Gradle, the `schema.sql` + `validate` model, CI/CD (jib→ECR→ECS), config & secrets
+9. **Build / run / deploy** — Gradle, the `schema.sql` + `validate` model, CI/CD (jib→ECR→ECS), config & secrets ✅
 10. **Migration context** — the modular-monolith refactor, phases, Java-now/Python-later, known issues
 
 *(✅ = written below)*
@@ -1052,3 +1052,83 @@ The four `(modules)` sub-trees map cleanly onto the backend areas:
    **workspace** is load-bearing.
 4. **One data-fetching stack everywhere:** `*.api.ts` → React Query `use*.ts` hook → component; URL
    query params carry view state.
+
+---
+
+# Step 9 — Build, run & deploy
+
+How the two apps are compiled, packaged, and shipped — and the one boot model that trips everyone.
+
+## 9.1 Build — Gradle, Java 21, jib (no Dockerfile)
+- **Gradle, not Maven** (`./gradlew`). Java **21** toolchain, Spring Boot **3.5.8**.
+- The **gate before any change:** `./gradlew compileJava compileTestJava` (must be green), then
+  `./gradlew test` before push (the full ~485-test suite **including `ModuleBoundariesTest`**).
+- **Packaging:** `bootJar` → `leadplus-service.jar` (plain `jar` disabled). **No Dockerfile** — the
+  **jib** plugin (3.5.1) builds the container image directly from `amazoncorretto:21-alpine`.
+- Also on the toolchain: `sonarqube` + `owasp-dependency-check` plugins (from the Agent-Factory setup
+  commit — scanning tooling).
+
+## 9.2 The boot model — schema is external (`validate`, not `create`)
+This is the thing that confuses everyone on day one:
+```yaml
+spring:
+  liquibase: { enabled: false }              # migrations DISABLED (Step-1 D3)
+  jpa: { hibernate: { ddl-auto: validate } } # Hibernate only VALIDATES, creates nothing
+  sql: { init: { mode: never } }
+```
+So **the app never creates its own tables.** You must apply `src/main/resources/schema.sql` (64
+tables) to an empty Postgres *once*; then Hibernate boots and validates that the entities match. If
+boot fails on a missing table/column, the fix is **update `schema.sql`** (as we did for
+`tenant_data_source`) — **never** "enable Liquibase" (its changelog is intentionally stale, D3).
+
+## 9.3 Config & secrets — committed dummies, injected at deploy
+`application.yml` ships with **dummy/blank secrets** (OpenAI = `"dummy-key-for-staging"`, empty AWS/
+OAuth keys) so it boots credential-free locally. The real values are injected **at deploy time**:
+`deploy.yml` **rewrites `application.yml` in place with `yq`** — **43 injections** pulling from GitHub
+Actions secrets/vars (datasource, `jwt.secret`, API keys, OpenAI/Anthropic keys, AWS creds, S3/
+CloudFront, Azure/Google/Zoho/HubSpot OAuth, the scheduler `enabled` flags, SES template names).
+> ⚠️ Two things to know: (1) the **`jwt.secret` and some values are committed in plaintext** in
+> `application.yml` (git history) — a hygiene issue (S4); (2) the **43-key yq rewrite is fragile** — a
+> single mistyped key name silently mis-injects (the audit found a `credkentials` typo on the GA
+> client-id line), and it's easy to add a config key and forget to wire its secret.
+
+## 9.4 Backend CI/CD — merge to `main` deploys to prod
+`.github/workflows/deploy.yml`, triggered on **push to `main`/`develop`**:
+```
+push main/develop
+  → derive namespace from branch (main → Production, else Development)
+  → yq-inject the 43 secrets into application.yml
+  → ./gradlew build           ← runs the FULL test suite + ModuleBoundariesTest (the real gate)
+  → configure AWS creds (us-west-2) → ECR login
+  → ./gradlew jib             ← build & push image to ECR (${ECR}/${SERVICE}-${NAMESPACE}:latest)
+  → aws ecs update-service --force-new-deployment   ← rolling deploy on ECS
+```
+**Merging to `main` = a production deploy.** This is why the Limark migration merging with a red build
+was so bad (M0) — and note the test gate runs on *push*, not as a *required PR check*, so a broken
+merge still reaches this pipeline. The env-gated context/staging tests stay off in CI.
+
+## 9.5 Frontend CI/CD — static files to S3
+`leadplus-portal/.github/workflows/deploy.yml` (on `develop`/`main`/`static`): Node 22 → write
+`NEXT_PUBLIC_*` from GitHub vars → `yarn build` (static export to `out/`) → `aws s3 sync out/ … --delete`
+→ CloudFront invalidation. No servers, no containers — just static files behind a CDN.
+
+## 9.6 Running it locally (the recap that saves you)
+- **Backend:** JDK 21; a Postgres (here: docker `leadplus-pg`, db/user/pass all `leadplus`); apply
+  `schema.sql` once; then
+  `SPRING_DATASOURCE_URL=… APP_OUTREACH_SCHEDULER_ENABLED=false ./gradlew bootRun` → `:8080/api`
+  (Swagger at `/api/swagger-ui`, health at `/api/actuator/health`).
+- **Frontend:** Node 20+; `.env.local` with `NEXT_PUBLIC_API_URL`; `npm run dev` → `:3000`.
+- **Safety golden rules:** never point at a prod DB; keep the outreach send-cron **OFF**
+  (`APP_OUTREACH_SCHEDULER_ENABLED=false`); keep mail-guard **ON**; don't enable Liquibase.
+- **Local-login gotcha:** signup emails don't arrive locally → `UPDATE tenant_user SET email_verified
+  = true WHERE email = '…'` to log in.
+
+## Takeaways from Step 9
+1. **Gradle + Java 21 + jib** (no Dockerfile); the gate is `./gradlew test` (unit + boundary).
+2. **Schema is external** — `ddl-auto: validate` against `schema.sql`; the app never creates tables;
+   fix boot failures by editing `schema.sql`, not enabling Liquibase.
+3. **Secrets are dummy in yml, injected by a 43-key `yq` rewrite at deploy** — fragile, and some are
+   committed in plaintext (S4).
+4. **Push to `main` → `yq` → `gradlew build` → `jib` → ECR → ECS** = a production deploy; the test gate
+   runs on push, not as a required PR check.
+5. Frontend = **static export → S3 + CloudFront** (no server).

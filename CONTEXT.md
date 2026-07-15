@@ -71,10 +71,10 @@ Update this every time a Step is written.
 | 6 | AI module — AIServicesModule, prompts, chat memory, Python seam | ✅ written |
 | 7 | Cross-cutting — security chains, exceptions, timezones, events, schedulers, infra | ✅ written |
 | 8 | Frontend — Next.js structure, token/auth flow, module gating, data-fetching | ✅ written |
-| 9 | Build / run / deploy — Gradle, schema/validate, CI/CD, config & secrets | ⬜ |
+| 9 | Build / run / deploy — Gradle, schema/validate, CI/CD, config & secrets | ✅ written |
 | 10 | Migration context — refactor, phases, Java-now/Python-later, known issues | ⬜ |
 
-**Current position:** Steps 1–8 written & pushed. **Next action = teach Step 9 (Build/run/deploy: Gradle, schema/validate, CI/CD jib→ECR→ECS, config & secrets).**
+**Current position:** Steps 1–9 written & pushed. **Next action = teach Step 10 (Migration context: modular refactor, phases, Java-now/Python-later, known issues) — the FINAL step.**
 
 ## 6. How to resume (do this in a fresh session)
 1. Read this `CONTEXT.md` and `README.md` to see how far the course got (Progress table + last Step).
