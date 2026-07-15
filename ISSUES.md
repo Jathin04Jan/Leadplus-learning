@@ -23,7 +23,7 @@ A living log of problems, risks, and gaps found in the LeadPlus platform while l
 | D4 | **Soft-delete via `active boolean`** — every query must remember `WHERE active = true`; forgetting it is a classic bug; makes unique constraints awkward. | 🟡 | 🔵 | Pattern-wide (lead_company, lead_contact, rfq, vendor, …). |
 | D5 | **Denormalized JSONB/`text` columns** for embedded objects (`email_data`, address/answers/lead-filter JSON converters) — lose queryability/indexability on contents; can't constrain. | 🟡 | 🔵 | Pragmatic (Mongo heritage); fine for read-mostly blobs. |
 | D6 | **Postgres array columns** (`varchar[]` for segments/tags/keywords) — non-standard, portability tax (H2 rejected `varchar[]` during the boot smoke test). | 🟡 | 🔵 | Works on Postgres; a friction point for tests/other engines. |
-| D7 | **The lead pool is a SHARED, cross-tenant global table** — `lead_company`/`lead_contact` use a `tenant_ids` **array** (not a per-tenant `tenant_id`); one person/company row is stored once and shared across tenants. Efficient (Apollo credits amortized — fetch once, all tenants benefit), but **tenant isolation for leads relies 100% on the data-pack gating `Specification` being applied on every query** (ties to S6). One query missing the gate spec → a tenant sees the whole global pool. Also a **data-governance** consideration: one tenant's Apollo-sourced PII is physically in a table other tenants query (separated by policy, not storage). | 🟠 | 🔵 | `leadgen/search/model/LeadContact.java`/`LeadCompany.java` (`tenantIds`); `TenantLeadService` (gate spec). Confirm this is contractually/GDPR-acceptable. |
+| D7 | **The lead pool is a SHARED, cross-tenant global table** — `lead_company`/`lead_contact` use a `tenant_ids` **array** (not a per-tenant `tenant_id`); one person/company row is stored once and shared across tenants. Efficient (Apollo credits amortized — fetch once, all tenants benefit), but **tenant isolation for leads relies 100% on the data-pack gating `Specification` being applied on every query** (ties to S6). One query missing the gate spec → a tenant sees the whole global pool. Also a **data-governance** consideration: one tenant's Apollo-sourced PII is physically in a table other tenants query (separated by policy, not storage). | 🟠 | 🟢 | **RESOLVED (wave-2 migration, branch `jathin/limark-migration-wave2`).** Remodeled to a scalar nullable `tenant_id` + shared/clone model (`NULL` = shared platform record, `X` = owned by tenant X). The `tenant_ids IS NULL → visible to all` leak is closed. `leadgen/search/model/{LeadContact,LeadCompany}.java`. |
 
 ## 2. Security & correctness (from full-codebase audit; mostly un-ticketed)
 
@@ -117,6 +117,23 @@ user value. Cross-references to the full entries above. **Decision needed per ro
 | P2 | **Verify + enable the Scraper (technographic/job-posting enrichment)** | Same dormant pattern as P1: all **3** scraper schedulers are `@ConditionalOnProperty(enabled=true)` but `scraper.scheduler.{scheduling,polling,job-detail}.enabled: false`, `scraper.api-key` is empty, and `deploy.yml` never sets them → the scraper has (almost certainly) never run in Corelabs post-refactor. Extra risk: it depends on an **external service** `scraper.base-url: https://playwright.dev.limarktech.com` — a **legacy Limark dev domain** that may no longer exist. To verify: enable the 3 flags + a dummy key and boot (confirm the beans/`ScrapeJob*` schedulers wire up), then hit `POST /v1/admin/scraper/schedule/{companyIdOrDomain}` against a real scraper endpoint. Confirm the external scraper service is still reachable/owned. |
 
 ---
+
+## 8. Wave-2 Limark migration (PR #46 feature port → branch `jathin/limark-migration-wave2`)
+
+The second Limark feature wave (PR #46) was migrated into the modular codebase across 6 commits
+(5 backend + 1 frontend): lead-pool remodel + lead delete/revision, Apollo company-search specs +
+LeadCompanyMapper, plan-tier feature gating + territory/org-chart, keyword match mode + lead
+assistant chat, reply-intent classification, and the full frontend (incl. the search-filter
+refactor). Backend green on `./gradlew test` (551 tests) + the full-context boot smoke; frontend
+green on `npm run typecheck` + `npm run build`. Unlike PRs #41/#42, boundaries + build gates were
+enforced per stage. Follow-ups / debt introduced:
+
+| # | Item | Sev | Status | Where / notes |
+|---|------|-----|--------|---------------|
+| W1 | **Import keyword/tech merge dropped** — `TenantContactImportService` was adapted onto the Admin/Workspace facades but Limark's company keyword/technology merge on import was intentionally omitted to keep the facade port minimal. Verify significance and restore if needed. | 🟡 | 🔵 | `leadgen/search/service/TenantContactImportService.java` |
+| W2 | **Campaign active-membership logic un-unit-tested** — `CampaignMembershipGuard`'s status matrix moved into `CampaignModule.hasActiveCampaignMembership` (RUNNING/PAUSED block, cross-tenant allow); the guard test now mocks the facade, so that specific status filtering has no dedicated unit test. | 🟡 | 🔵 | `leadgen/campaign/CampaignModule.java` — add a focused test. |
+| W3 | **New tables show as "unowned" in SCHEMA.md** — the schema-md generator's table→module heuristic doesn't map the 5 new tables (apollo_company_search_specification, lead_company/contact_revision, territory_rep/state_assignment). Cosmetic; entities ARE module-owned. | 🟡 | 🔵 | `scripts/generate-schema-md.py` ownership map. |
+| W4 | **Apollo lead contact/company endpoints re-pathed + admin-gated** — mirrors the Limark source (now `/v1/admin/companies`, `/v1/admin/contacts`); a behavioral change vs the prior Corelabs paths, no test coverage on the path change. Confirm no other caller depended on the old paths. | 🟡 | 🔵 | `leadgen/search/controller/ApolloLead*Controller.java` |
 
 ## How to append
 When we find something new while going through the course:
