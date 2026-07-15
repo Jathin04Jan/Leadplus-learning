@@ -72,9 +72,11 @@ Update this every time a Step is written.
 | 7 | Cross-cutting — security chains, exceptions, timezones, events, schedulers, infra | ✅ written |
 | 8 | Frontend — Next.js structure, token/auth flow, module gating, data-fetching | ✅ written |
 | 9 | Build / run / deploy — Gradle, schema/validate, CI/CD, config & secrets | ✅ written |
-| 10 | Migration context — refactor, phases, Java-now/Python-later, known issues | ⬜ |
+| 10 | Migration context — refactor, phases, Java-now/Python-later, known issues | ✅ written |
 
-**Current position:** Steps 1–9 written & pushed. **Next action = teach Step 10 (Migration context: modular refactor, phases, Java-now/Python-later, known issues) — the FINAL step.**
+**Current position:** ✅ **ALL 10 STEPS COMPLETE** (written & pushed). The core course is finished.
+Remaining possible follow-ups (only if the learner asks): deep-dives on specific flows, keep
+appending to `ISSUES.md` as new gaps surface, or verify/enable the dormant features (P1 Apollo, P2 Scraper).
 
 ## 6. How to resume (do this in a fresh session)
 1. Read this `CONTEXT.md` and `README.md` to see how far the course got (Progress table + last Step).

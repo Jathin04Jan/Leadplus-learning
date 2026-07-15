@@ -23,9 +23,9 @@ depth; read it, ask follow-ups, then advance to the next.
 7. **Cross-cutting** — security filter chains, exceptions, timezones, events, schedulers, S3/email infra ✅
 8. **The frontend** — Next.js structure, token/auth flow, module gating, the data-fetching pattern ✅
 9. **Build / run / deploy** — Gradle, the `schema.sql` + `validate` model, CI/CD (jib→ECR→ECS), config & secrets ✅
-10. **Migration context** — the modular-monolith refactor, phases, Java-now/Python-later, known issues
+10. **Migration context** — the modular-monolith refactor, phases, Java-now/Python-later, known issues ✅
 
-*(✅ = written below)*
+*(✅ = written below — **all 10 steps complete**)*
 
 ---
 
@@ -1132,3 +1132,105 @@ merge still reaches this pipeline. The env-gated context/staging tests stay off 
 4. **Push to `main` → `yq` → `gradlew build` → `jib` → ECR → ECS** = a production deploy; the test gate
    runs on push, not as a required PR check.
 5. Frontend = **static export → S3 + CloudFront** (no server).
+
+---
+
+# Step 10 — Migration context (why the codebase looks the way it does)
+
+Everything you've learned makes sense once you know one thing: **this codebase is mid-migration.** The
+module boundaries, the facades, the disabled Liquibase, the "Java now / Python later" seams — they're
+all steps in a deliberate, phased plan. This final step is the *why*.
+
+## 10.1 The THREE migrations (never conflate them)
+The single biggest source of confusion. There are three distinct migrations in this project's history:
+| # | Migration | What it did | Where |
+|---|-----------|-------------|-------|
+| 1 | **Mongo → Postgres** (data layer) | Converted MongoDB collections to Postgres tables; ObjectId refs became `bigint` → **left no FKs** | happened *inside Limark* |
+| 2 | **Modular-monolith refactor** | Copied Limark → `Leadplus-corelabs`, then moved ~940 classes into 11 bounded modules + facades | created *our repo* |
+| 3 | **Limark feature migration** (PRs #41/#42) | Ported new Limark features (contact import, etc.) into the modular repo — **broke the build** | the one you repaired |
+Migration #1 explains the no-FK schema (Step 1); #2 explains the whole module architecture (Step 2);
+#3 is the recent breakage (`MIGRATION-GAPS-REPORT.md`). Keep them separate in your head.
+
+## 10.2 The three architecture decisions (the north star)
+From `Docs/Architecture-Decisions.md`:
+1. **Java now, Python later — for AI only.** Don't rewrite the Spring service. Do the modular
+   boundaries *first* (so a clean seam exists), then extract only `shared/ai` into a **stateless
+   Python service** behind the *same* `AIServicesModule` interface (Step 6). The boundaries you
+   maintain today literally *are* the future service lines.
+2. **Absorb the Node intelligence-service into that Python service** (Phase 4) — the small
+   Node/Mongo enrichment helper (still frozen in `Limark/`) folds into the Python service, migrating
+   language + DB at once.
+3. **Finish Mongo → Postgres; Postgres is the only operational DB.** MongoDB Atlas is sunset once
+   both Java and the future Python service are on Postgres.
+
+## 10.3 The 4-phase roadmap — and where we are
+```
+Phase 0  Unbreak the build (Long/String DTO fixes)                      ✅ (was already green on audit)
+Phase 1  Modular monolith — 11 modules, facades, boundary test          ✅ CODE COMPLETE (boots & runs)
+Phase 2  Finish Mongo→Postgres cutover (data migration, sunset Atlas)   ⏳ pending
+Phase 3  Extract shared/ai → a stateless Python service                 ⏳ pending
+Phase 4  Absorb the Node intelligence-service into that Python service  ⏳ pending
+```
+**We are at the end of Phase 1.** The modular refactor is done (Day-1→10: skeletons → audits → the
+Day-4 file shuffle of ~940 classes → CONTEXT.md content → boundary fixes → tests → validation). The
+app boots and runs locally. **Remaining for Phase 1:** the credential-dependent validation items + a
+dev ECS deploy. Phases 2–4 haven't started. *(And on top of Phase 1, the recent Limark feature
+migration + our repair happened — that's out-of-band feature work, not a phase.)*
+
+## 10.4 The 4 dependency cycles — the reason for the leaf/`@Lazy` design
+The plan-as-written had **4 dependency cycles**; they were resolved **up front** (Step 2/5), which is
+why the module graph is acyclic and why you see leaves + `@Lazy` everywhere:
+| Cycle | Resolution |
+|-------|-----------|
+| `auth ↔ workspace` | **auth = leaf** (identity/tokens only); tenant resolution lives in workspace |
+| `buyer ↔ rfq` | **rfq = leaf** for buyer; buyer context passed *in* as a parameter |
+| `vendor ↔ rfq` | same — context passed in, never fetched back |
+| `campaign ↔ tracking` | **event-based** — tracking publishes, campaign `@EventListener`s |
+
+## 10.5 The revised Definition of Done (why some things look "unfinished")
+The original plan assumed ~196 classes, a broken build, and MongoDB. **Reality was different**
+(`Docs/Migration-Plan-Revised.md`): **922+ classes, a green build already on PostgreSQL, 4 cycles, and
+2 pre-existing AI bypasses.** So the DoD was **revised** — which is why you'll see: the boundary test
+enforced for a *subset* with **documented exemptions** (the 2 AI bypasses, the OAuth adapters), an
+**8-module backlog** of audited-but-unfixed violations (`boundary-violations.csv`), and Liquibase left
+disabled. These aren't oversights — they're **scoped, documented deviations**. When something looks
+half-done, check `Docs/SCOPE-DECISIONS.md` before assuming it's a bug.
+
+## 10.6 What this means for *you* (the working mental model)
+- **You're working in a modular monolith that's deliberately heading toward a Java + Python split.**
+  Treat the module boundaries as sacred — they're the future service lines. Adding a feature = one
+  module + facade calls/events (never reach into internals).
+- **`shared/ai` is the live extraction target.** Anything you do there should keep the
+  `AIServicesModule` interface clean and memory Java-side (so the Python swap stays trivial). The 4
+  bypasses (A1) are the debt to clear before that extraction.
+- **The docs are partly stale** (they describe the *plan*, and reality diverged): CONTEXT.md files say
+  facades are "planned" (they're built), `RESUME-HERE` says Liquibase was re-enabled (it's disabled),
+  `rfq` claims "auth-only" (it's not). **Trust the code; use `ISSUES.md` for the verified truth.**
+- **Merging to `main` deploys to prod** (Step 9) with only a push-time (not required-PR) test gate —
+  so the discipline of "green build + boot before merge" is on you (the M0 lesson).
+
+## 10.7 Where to read next (the doc map + this course)
+`Docs/` reading order: `RESUME-HERE` → `SCOPE-DECISIONS` → `Architecture-Decisions` → `audit/README` →
+`audit/KNOWN-ISSUES` → `SCHEMA` → `RUN-AND-TEST-GUIDE`. And each module's `CONTEXT.md` before you
+touch it. This course's [`ISSUES.md`](./ISSUES.md) is the *verified* gap register; the two reports
+(`LIMARK-LEGACY-GAPS-REPORT`, `MIGRATION-GAPS-REPORT`) are the audience-specific writeups.
+
+## Takeaways from Step 10
+1. **Three migrations** — Mongo→Postgres (no-FKs), the modular refactor (the architecture), the Limark
+   feature port (the breakage). Don't conflate them.
+2. **The plan: Java now / Python later, AI-first**, on Postgres-only — and the **module boundaries are
+   the future service lines**.
+3. **We're at the end of Phase 1** (modular monolith done, boots/runs); Phases 2–4 (DB cutover, AI→
+   Python, absorb Node) are pending.
+4. **"Half-done" is often *scoped*** (documented exemptions/backlog) — check `SCOPE-DECISIONS.md`; and
+   **the docs are stale — trust the code.**
+
+---
+
+## 🎓 Course complete
+You now have the full mental model: the **two-halves product** (LeadGen + RFQ marketplace), the
+**modular-monolith architecture** (facades + events + enforced boundaries), **identity & multi-tenancy**,
+the **LeadGen engine** and the **RFQ marketplace** in depth, the **AI module** (and its Python seam),
+the **cross-cutting plumbing**, the **frontend**, **build/deploy**, and the **migration context** that
+ties it all together. Pair this with [`ISSUES.md`](./ISSUES.md) (the verified gaps) and you can both
+*build* in this codebase and *reason about its risks*. Welcome to the project. 🚀
