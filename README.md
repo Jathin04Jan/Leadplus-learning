@@ -20,7 +20,7 @@ depth; read it, ask follow-ups, then advance to the next.
 4. **The LeadGen engine** — `search → campaign → outreach → tracking` (leads, sequences, the send cron, reply/bounce/unsubscribe) ✅
 5. **The RFQ marketplace** — `buyer / vendor / rfq` (onboarding, RFQ→quotation lifecycle, collaborators) ✅
 6. **The AI module** — how all AI funnels through `AIServicesModule`, prompts, chat memory, the Python-extraction seam ✅
-7. **Cross-cutting** — security filter chains, exceptions, timezones, events, schedulers, S3/email infra
+7. **Cross-cutting** — security filter chains, exceptions, timezones, events, schedulers, S3/email infra ✅
 8. **The frontend** — Next.js structure, token/auth flow, module gating, the data-fetching pattern
 9. **Build / run / deploy** — Gradle, the `schema.sql` + `validate` model, CI/CD (jib→ECR→ECS), config & secrets
 10. **Migration context** — the modular-monolith refactor, phases, Java-now/Python-later, known issues
@@ -858,3 +858,103 @@ kill-switch** for AI, despite the config implying one.
    uses real tools (`countLeads`).
 5. The centralization rule **leaks in 4 places** (docs/test disagree on which), and there's **no
    working AI kill-switch** — both matter for the planned extraction.
+
+---
+
+# Step 7 — Cross-cutting concerns
+
+The plumbing every request and feature relies on, most of it in `api/configurations`, `api/common`,
+and `application/{common,exception}` (the "shared allowlist" from Step 2). Small pieces, but you'll
+hit all of them.
+
+## 7.1 Security filter chains (recap + the API-key chains)
+Covered in Step 3, but the full set (`SecurityConfiguration.java`), all `STATELESS`, matched by URL:
+1. **`/v1/facts/**`** → API-key chain (`ApiKeyAuthenticationFilter`, `X-API-KEY`) **or** `ROLE_ADMIN` — system-to-system.
+2. **`/v1/companies/**`, `/v1/contacts/**`** → a *second* API-key chain (a different lead-ingest key) or `ROLE_ADMIN`.
+3. **Everything else** → the JWT chain (`JwtAuthenticationFilter` for login, `JwtAuthorizationFilter` per request, guest fallback).
+
+Also here: `CorsConfig` / `addCorsMappings` — currently **allow-all origins + headers** (a prod
+security smell, ISSUES.md S7), plus `OpenApiConfig` (Swagger Bearer auth) and a `RestTemplate` bean.
+
+## 7.2 Exception handling — no global handler, per-exception status
+There is **no global `@ControllerAdvice` exception handler** (the *only* `@ControllerAdvice` is the
+datetime advice below). Instead, each exception in `application/exception` carries its own
+`@ResponseStatus`, so Spring maps it to an HTTP code automatically:
+```
+BadRequestException → 400 · UnauthorizedException → 401 · EmailAlreadyExists → 409(CONFLICT)
+OtpResendTooSoon → 429 · SmtpConnection → 503 · AzureUnauthorized/Bad → 502(BAD_GATEWAY) …
+```
+**⚠️ The quirk to remember:** `ResourceNotFoundException` maps to **`410 GONE`, not `404`.** So
+"thing not found" returns 410 across the app — non-standard (410 means "was here, permanently gone"),
+and it can surprise clients/caches. Also, since there's no catch-all advice, any *unmapped* exception
+falls through to a raw `500` — and `server.error.include-message: always` means the exception message
+is exposed in the body. (Minor API-hygiene items, ISSUES.md X6.)
+
+## 7.3 Timezone handling — UTC in the DB, convert on the way out
+A neat, centralized mechanism in `api/common/datetime`:
+```
+request → X-TimeZone header → TimeZoneInterceptor stores ZoneId in TimeZoneContext (a ThreadLocal, default UTC)
+response → LocalDateTimeResponseBodyAdvice (@ControllerAdvice ResponseBodyAdvice)
+           reflectively walks EVERY response object (Page, collections, maps, nested fields)
+           and converts each LocalDateTime from UTC → the client's zone
+```
+So: **the DB always stores UTC; conversion is presentation-only, applied automatically to every
+response.** The frontend sends `X-Timezone` from `Intl.DateTimeFormat`; the backend does the rest.
+You never manually convert times in a controller — the advice handles it. (Cost: it reflects over
+every response body, which is a bit heavy, but invisible to you as a developer.)
+
+## 7.4 Events — the decoupling backbone (mechanism)
+You've seen events used per-module (Steps 4–5); here's the mechanism in one place:
+- **Publish:** `ApplicationEventPublisher.publishEvent(new XEvent(source, ids…))`.
+- **Consume:** `@EventListener` (often `@Async`, and sometimes `@TransactionalEventListener` to fire
+  only after the publisher's transaction commits — e.g. the RFQ quotation fan-out).
+- **Rule:** events carry **IDs + cheap primitives only** — listeners re-fetch fresh state via facades.
+- Scale in the codebase: **27** `*Event` types, **11** `@EventListener` classes, **11** `@Async`.
+This is *the* pattern that lets modules react to each other without depending on each other (the
+campaign↔tracking cycle-break, the CampaignEmailSentEvent 3-listener fan-out, etc.).
+
+## 7.5 Schedulers — the "cron + kill-switch + manual trigger" pattern
+There are **10 `@Scheduled` methods**, spread across outreach (3), admin/scraper (3), tracking (2),
+campaign (1), workspace (1). **Every one follows the same shape** (once you see it, they all read the same):
+```java
+@ConditionalOnProperty(name = "<x>.scheduler.enabled", havingValue="true"[, matchIfMissing=true])  // kill-switch
+@Scheduled(cron = "${<x>.scheduler.cron}")                                                          // schedule
+public void doWork() { service.doWork(); }
+```
+…and most have a **manual admin/POST endpoint** to run the same work on demand (the scraper's
+`/v1/admin/scraper/*`, the reply-sync triggers, etc.). The 10: the outreach send-loop + mailbox reset
++ mailgun conversation sync, the 3 scraper phases, the 2 reply-syncs (Gmail/Azure), the campaign
+orchestration cron, the announcement orchestrator. **Dev-safety:** most default OFF (`enabled: false`);
+the send-loop defaults ON (`matchIfMissing=true`) so remember `APP_OUTREACH_SCHEDULER_ENABLED=false`
+locally (Step 9).
+
+## 7.6 Infrastructure — S3, email, and the JSON/array converters
+- **S3** (`AwsS3Service` + `AwsS3Client`, in workspace): stores attachments, lead-import files, and
+  email images; served back via the CloudFront URL. Facaded as `WorkspaceModule.uploadFile / readS3FileStream`.
+- **Email — 5 senders:** `GmailEmailService`, `AzureEmailService` (Outlook/Graph), `AwsSESService`
+  (SES), `SpringMailService` (SMTP — hardcoded `smtp.gmail.com`), `MailgunEmailService`. Campaign
+  sends pick one by mailbox type (Step 4.3); **transactional/notification** email goes through
+  workspace's `EmailService`, which delegates to `OutreachModule.sendTemplatedEmail` via a best-effort
+  `safeSend` (swallows send failures so a bad email never rolls back a business transaction — a fix
+  from the dev-data-seeding work).
+- **`domain/common` converters:** the JPA `AttributeConverter`s that make the JSONB/array columns work
+  — `JsonConverter`, `StringListConverter`, `AddressConverter`, `OtpConverter`, `EnumListConverter`,
+  etc. Any entity field that's an embedded object or a `varchar[]` uses one of these. They live in the
+  shared allowlist, so any module can use them.
+
+## 7.7 Bootstrap (`api/configurations`)
+The wiring that isn't in any feature module: the 3 security chains + login/authorization filters,
+`CorsConfig`, `OpenApiConfig` (Swagger at `/api/swagger-ui`), `AppConfig` (`RestTemplate`),
+`WebConfiguration` (registers the `TimeZoneInterceptor`), and `AuthenticationProperties` (the API
+keys). This layer is *allowed* to wire modules together (it imports `AuthModule`/services) — it's the
+composition root.
+
+## Takeaways from Step 7
+1. **No global exception handler** — per-exception `@ResponseStatus`; **`ResourceNotFoundException` =
+   410 GONE** (not 404) is the gotcha.
+2. **Times are UTC in the DB**, auto-converted to the client's `X-Timezone` on every response by a
+   reflective `ResponseBodyAdvice` — you never convert manually.
+3. **Events** (27 types, ID-only, `@Async`/`@TransactionalEventListener`) are the decoupling backbone.
+4. **Schedulers** all share the **cron + `enabled` kill-switch + manual trigger** shape (10 of them).
+5. **Infra** = S3 (via workspace), 5 email senders (+ `safeSend` for notifications), and the
+   `domain/common` converters that power the JSONB/array columns.
