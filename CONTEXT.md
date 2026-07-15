@@ -68,13 +68,13 @@ Update this every time a Step is written.
 | 3 | Identity & multi-tenancy — auth (JWT/login/signup/OAuth) + workspace (tenant→workspace→user) | ✅ written |
 | 4 | LeadGen engine — search → campaign → outreach → tracking | ✅ written |
 | 5 | RFQ marketplace — buyer / vendor / rfq | ✅ written |
-| 6 | AI module — AIServicesModule, prompts, chat memory, Python seam | ⬜ |
+| 6 | AI module — AIServicesModule, prompts, chat memory, Python seam | ✅ written |
 | 7 | Cross-cutting — security chains, exceptions, timezones, events, schedulers, infra | ⬜ |
 | 8 | Frontend — Next.js structure, token/auth flow, module gating, data-fetching | ⬜ |
 | 9 | Build / run / deploy — Gradle, schema/validate, CI/CD, config & secrets | ⬜ |
 | 10 | Migration context — refactor, phases, Java-now/Python-later, known issues | ⬜ |
 
-**Current position:** Steps 1–5 written & pushed. **Next action = teach Step 6 (AI module: AIServicesModule, prompts, chat memory, Python seam).**
+**Current position:** Steps 1–6 written & pushed. **Next action = teach Step 7 (Cross-cutting: security chains, exceptions, timezones, events, schedulers, S3/email infra).**
 
 ## 6. How to resume (do this in a fresh session)
 1. Read this `CONTEXT.md` and `README.md` to see how far the course got (Progress table + last Step).

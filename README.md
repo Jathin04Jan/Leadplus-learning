@@ -19,7 +19,7 @@ depth; read it, ask follow-ups, then advance to the next.
 3. **Identity & multi-tenancy** — `auth` (JWT/login/signup/OAuth) + `workspace` (tenant→workspace→user); how a request is authenticated and scoped ✅
 4. **The LeadGen engine** — `search → campaign → outreach → tracking` (leads, sequences, the send cron, reply/bounce/unsubscribe) ✅
 5. **The RFQ marketplace** — `buyer / vendor / rfq` (onboarding, RFQ→quotation lifecycle, collaborators) ✅
-6. **The AI module** — how all AI funnels through `AIServicesModule`, prompts, chat memory, the Python-extraction seam
+6. **The AI module** — how all AI funnels through `AIServicesModule`, prompts, chat memory, the Python-extraction seam ✅
 7. **Cross-cutting** — security filter chains, exceptions, timezones, events, schedulers, S3/email infra
 8. **The frontend** — Next.js structure, token/auth flow, module gating, the data-fetching pattern
 9. **Build / run / deploy** — Gradle, the `schema.sql` + `validate` model, CI/CD (jib→ECR→ECS), config & secrets
@@ -739,3 +739,122 @@ This is **ISSUES.md S1/S2** — the concrete instance of the S6 "no automatic te
    quotation per vendor → QUOTED → ACCEPTED/REJECTED. **RFP is backend-built but UI-stubbed.**
 5. **Security:** collaborator checks exist but the **main RFQ CRUD skips them (IDOR, S1)** — the
    marketplace's headline risk.
+
+---
+
+# Step 6 — The AI module (`shared/ai`)
+
+One module owns **every** AI call in the platform. It exists for two reasons: (1) a single place to
+manage prompts, the model, and chat memory; (2) it's the deliberate **seam for a future Python
+extraction** — swap the implementation for an HTTP client and nothing else changes. (Reality check:
+the "every AI call goes through here" rule has holes — see §6.6.)
+
+## 6.1 `AIServicesModule` — the facade (and the Python seam)
+The single public class. Its whole surface:
+```java
+MessageDto createMessage(dto, type)                                  // persist a chat message
+VendorSearchParseDto parseVendorSearchQuery(prompt)                  // NL → vendor filters (throws if AI off)
+<T> T getChatCompletion(userPrompt, systemPrompt, Class<T>)          // one-shot, structured output
+<T> T getChatCompletion(userPrompt, systemPrompt, conversationId, Class<T>, functions...) // + memory + tools
+List<MessageDto> getLeadChatMessages(tenantId, userId, conversationId)
+```
+It injects `Optional<SpringAiClient>`, `Optional<VendorQueryParser>`, `MessageService` — the
+`Optional`s are the (illusory) "AI might be off" wiring from AI4.
+
+**Why this is the extraction seam:** callers depend only on these method signatures. Today they
+delegate to a Java `SpringAiClient`; tomorrow the same methods delegate to an **HTTP client hitting a
+Python AI service** — and not one caller changes. (Chat memory is kept Java-side on purpose, §6.3, so
+the Python service can stay stateless.)
+
+## 6.2 `SpringAiClient` — the low-level wrapper (Spring AI)
+The only class that actually talks to the model (`OpenAiChatModel`, `gpt-4.1-mini`). One line does the
+work, and it shows three important Spring AI features:
+```java
+ChatClient.create(chatModel).prompt()
+    .tools(functions)                                    // 1. TOOL/function calling
+    .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, conversationId))  // 2. MEMORY (overload only)
+    .user(userPrompt).system(systemPrompt)
+    .call()
+    .entity(clazz);                                      // 3. STRUCTURED OUTPUT → a typed DTO
+```
+- **`.entity(clazz)` (structured output)** — the LLM's response is parsed straight into a typed Java
+  object (`LeadChatCompletion`, `VendorSearchParseDto`, `ColumnMappingCompletion`, …). No manual JSON
+  parsing — this is why AI results flow cleanly into the rest of the app.
+- **`.tools(...)` (function calling)** — the LLM can *call back into your code* mid-conversation (§6.5).
+- **`.advisors(CONVERSATION_ID)`** — attaches conversation memory (§6.3).
+
+## 6.3 Chat memory — DB-backed, sliding window, Java-side
+Memory is wired in `ChatClientConfig`:
+```
+ChatClient bean = OpenAiChatModel + MessageChatMemoryAdvisor( MessageWindowChatMemory( repo = SpringAiChatMemory ) )
+```
+- `MessageWindowChatMemory` = keep a **window of the last N turns** (not the whole history).
+- `SpringAiChatMemory implements ChatMemoryRepository` — the bridge to *your* DB:
+  - `findByConversationId(id)` → loads the **top-5 messages** for that conversation from the `message`
+    table (`messageService.getTop5MessagesByConversationId`) and maps them to Spring AI messages.
+  - **`saveAll(...)` and `deleteByConversationId(...)` are deliberate no-ops** — the app persists
+    messages *explicitly* via `MessageService.createMessage`, not through the advisor.
+
+So on each chat call: Spring AI asks `SpringAiChatMemory` for recent history (last 5 from the DB),
+prepends it to the prompt, calls the model; the app separately saves the new exchange. **Memory lives
+in the `message` table, not in the model/session** — which is exactly what lets the future Python
+service be stateless (it gets history passed in; it stores nothing).
+
+The **`message` table**: `tenantId, workspaceId, conversationId, userId, type, request, response,
+campaignId, targetingCriteria (JSONB), searchPerformed`. `MessageType` = the 4 stateful chat features:
+`CUSTOMER_CHAT_ASSISTANT · LEAD_CHAT_ASSISTANT · CAMPAIGN_GENERATOR · CAMPAIGN_AGENT`.
+
+## 6.4 The prompts — 8 personas as classpath files
+Prompts are markdown files in `src/main/resources/prompts/` (loaded as `static final` strings — the
+fragile-boot pattern, ISSUES.md AI2). The **8** personas:
+| Prompt | Used by | Stateful? |
+|--------|---------|-----------|
+| `customer-chat-assistant.md` | `ChatService` (public marketplace chat) | ✅ memory |
+| `lead-chat-assistant.md` | `LeadChatService` (chat over lead search) | ✅ memory |
+| `campaign-generator.md` | `CampaignGeneratorService` (build a campaign from chat) | ✅ memory |
+| `campaign-agent.md` | `CampaignAgentService` (**agentic** — with tools) | ✅ memory + tools |
+| `vendor-query-parser.md` | `VendorQueryParser` (NL → vendor filters) | ❌ one-shot |
+| `campaign-email-generator.md` | `CampaignEmailAiService` (draft sequence emails) | ❌ one-shot |
+| `contact-email-generator.md` | `ContactEmailAiService` (draft a one-off email) | ❌ one-shot |
+| `column-mapping-system-prompt.md` | `AiColumnMapperService` (map import columns) | ❌ one-shot |
+`VendorQueryParser` also does `{{PLACEHOLDER}}` substitution — it injects the live service/industry/
+spec lists from `AdminModule` into the prompt, then resolves the model's name output back to ids.
+
+## 6.5 Two shapes of AI usage — chatbots vs one-shots (and the agent)
+- **Stateful chatbots** (the 4 `MessageType`s) — carry a `conversationId`, use memory, persist to
+  `message`. E.g. the customer marketplace assistant, the lead-search chat, the campaign generator.
+- **Stateless one-shots** — no memory; call → typed result. E.g. NL vendor parse, email drafting,
+  title normalization, import column mapping.
+- **The agent** (`CampaignAgentService`) is the interesting one: it passes
+  `.tools(leadSearchAgentTools, campaignTools)`, and `LeadSearchAgentTools` exposes an
+  `@Tool(name="countLeads")` method. So during the conversation the **LLM can decide to call
+  `countLeads(...)`**, which actually queries the lead DB and returns a real number — then the model
+  continues with grounded data. That's the "AI agent + tools" pattern: the model reasons, but *your
+  code* does the real work when it calls a tool.
+
+## 6.6 The reality of the "all AI goes through `AIServicesModule`" rule
+The rule is real but **leakier than advertised** — **four** classes reach the model directly instead
+of via the facade, and (annoyingly) **the docs and the boundary test name *different* pairs**:
+- `ModuleBoundariesTest` exempts **`CampaignEmailAiService`, `ContactEmailAiService`** (they import `SpringAiClient`).
+- `AIServicesModule`'s javadoc names **`CampaignGeneratorService`, `CampaignAgentService`** (they inject the `ChatClient` bean directly — which the boundary test *doesn't* catch, since `ChatClient` is a framework class, not an `ai.leadplus` module import).
+- So really **all four** bypass the facade. That matters for the Python extraction: those four would
+  each need to be routed through `AIServicesModule` first, or they'll still be calling a local model
+  after the rest moves to Python. (ISSUES.md A1, updated.)
+
+## 6.7 …and remember it's effectively always-on (AI4)
+From Step-1's AI audit: the `spring.spring-ai.enabled: false` flag is **dead**, the beans are
+unconditional, and `getChatCompletion(...).orElse(null)`'s "returns null when off" is unreachable. So
+in practice AI always attempts a real OpenAI call (401 in dev with the dummy key). There is **no real
+kill-switch** for AI, despite the config implying one.
+
+## Takeaways from Step 6
+1. **`AIServicesModule` is the one door + the Python seam** — swap its impl for an HTTP client and
+   callers don't change.
+2. **Spring AI gives three things:** structured output (`.entity`), tools/function-calling (`.tools`),
+   and conversation memory (`.advisors`) — all visible in the one `SpringAiClient` method.
+3. **Memory is DB-backed and Java-side** (`message` table, last-5 window, explicit saves) so the
+   future Python service stays stateless.
+4. **8 prompt personas**, split into **4 stateful chatbots** + 4 one-shots; the **campaign agent**
+   uses real tools (`countLeads`).
+5. The centralization rule **leaks in 4 places** (docs/test disagree on which), and there's **no
+   working AI kill-switch** — both matter for the planned extraction.
