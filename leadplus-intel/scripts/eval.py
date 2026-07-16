@@ -36,6 +36,7 @@ import httpx
 import yaml
 
 from intel import repository, retrieve, score
+from intel.main import triage  # §1's gate — the tuner must refuse exactly as the endpoint does
 from intel.models import Chips, IntentMode
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -125,6 +126,26 @@ def evaluate(query: dict[str, Any], ranked: Sequence[int]) -> Row:
     relevant = set(query["relevant"])
     forbidden = set(query.get("forbidden") or [])
     depth = query.get("forbidden_in_top", len(ranked))
+    violations = [c for c in ranked[:depth] if c in forbidden]
+
+    if not relevant:
+        # CHANGES-v2 §1's refusal rows: the correct answer is the EMPTY LIST. The standard metrics
+        # cannot express that — every one of them divides by something the query does not have,
+        # so a perfectly correct refusal would score 0.000 across the board and the tuner would
+        # spend its budget trying to "fix" the one behaviour we most want. So the row is scored on
+        # the only question it asks: did anything come back? Nothing = right.
+        correct = 0.0 if ranked else 1.0
+        return Row(
+            id=query["id"],
+            p_at_10=correct,
+            ceiling=1.0,
+            recall_at_50=correct,
+            recall_ceil=1.0,
+            mrr=correct,
+            violations=violations,
+            discriminating=bool(query.get("discriminating")),
+        )
+
     return Row(
         id=query["id"],
         p_at_10=precision_at(ranked, relevant),
@@ -132,7 +153,7 @@ def evaluate(query: dict[str, Any], ranked: Sequence[int]) -> Row:
         recall_at_50=recall_at(ranked, relevant),
         recall_ceil=recall_ceiling(relevant),
         mrr=mrr(ranked, relevant),
-        violations=[c for c in ranked[:depth] if c in forbidden],
+        violations=violations,
         discriminating=bool(query.get("discriminating")),
     )
 
@@ -221,7 +242,8 @@ class Prepared:
     chips: Chips
     retrieval: Any
     matcher: Any
-    asked_industry: str | None
+    asked_industries: list[str]
+    refused: bool = False
 
 
 async def prepare_all(queries: list[dict[str, Any]]) -> list[Prepared]:
@@ -230,18 +252,38 @@ async def prepare_all(queries: list[dict[str, Any]]) -> list[Prepared]:
         matcher = score.TermMatcher(repository.fetch_known_technologies(conn))
         for query in queries:
             chips = Chips.model_validate(query["chips"])
+
+            # §1 runs here too. `prepare_all` reimplements `run_search`'s core in-process so the
+            # tuner can re-score without re-retrieving; if it skipped the triage the tuner would
+            # retrieve on chips the endpoint refuses, and the refusal rows would measure a code
+            # path that no user can reach.
+            chips, refusal = triage(chips)
+            if refusal:
+                out.append(
+                    Prepared(
+                        query=query,
+                        chips=chips,
+                        retrieval=None,
+                        matcher=matcher,
+                        asked_industries=[],
+                        refused=True,
+                    )
+                )
+                print(f"  refused   {query['id']}: {chips.intent.value} — retrieval never ran")
+                continue
+
             chips = chips.model_copy(
-                update={"industry": retrieve.canonical_industry(conn, chips.industry)}
+                update={"industries": retrieve.canonical_industries(conn, chips.industries)}
             )
             vectors = await retrieve.prepare(chips)
-            retrieval = retrieve.retrieve(conn, chips, vectors)
+            retrieval = retrieve.retrieve(conn, chips, vectors, matcher)
             out.append(
                 Prepared(
                     query=query,
                     chips=chips,
                     retrieval=retrieval,
                     matcher=matcher,
-                    asked_industry=chips.industry,
+                    asked_industries=retrieve.positive_values(chips.industries),
                 )
             )
             print(f"  retrieved {query['id']}: {retrieval.list_sizes['candidates']} candidates")
@@ -251,11 +293,14 @@ async def prepare_all(queries: list[dict[str, Any]]) -> list[Prepared]:
 def score_rows(prepared: list[Prepared], tuning: score.Tuning, now: dt.datetime) -> list[Row]:
     rows: list[Row] = []
     for item in prepared:
+        if item.refused:
+            rows.append(evaluate(item.query, []))
+            continue
         results = score.rank(
             retrieval=item.retrieval,
             chips=item.chips,
             matcher=item.matcher,
-            asked_industry=item.asked_industry,
+            asked_industries=item.asked_industries,
             now=now,
             limit=R_AT,
             tuning=tuning,
@@ -323,7 +368,10 @@ async def tune(queries: list[dict[str, Any]]) -> None:
     report(before, title="BEFORE — the invented numbers from §8.2 / §8.5")
 
     # ---- §8.5 first: the multiplier is independent of the weight profile.
-    industry_items = [p for p in prepared if p.asked_industry]
+    # §8.5's tiers can only be falsified by a query that asks for an industry *softly*: with
+    # `industry_strict` the multiplier is skipped entirely (CHANGES-v2 §5), so those queries would
+    # score identically for every tier value and would dilute the sweep with noise.
+    industry_items = [p for p in prepared if p.asked_industries and not p.chips.industry_strict]
     spec_tiers = (base.near_threshold, base.near_multiplier, base.far_multiplier)
     baseline = composite(score_rows(industry_items, base, now))
     print(f"\nsweeping §8.5 tiers over {len(industry_items)} industry queries "
@@ -360,7 +408,10 @@ async def tune(queries: list[dict[str, Any]]) -> None:
     tuned_weights = {mode: dict(w) for mode, w in base.weights.items()}
     grid = weight_grid()
     for mode in IntentMode:
-        items = [p for p in prepared if p.chips.intent_mode == mode]
+        # Refused rows are excluded: they score 1.0 for every profile (nothing is returned, which
+        # is correct), so including them would add a constant to every candidate and shrink the
+        # visible spread between profiles without changing which one wins.
+        items = [p for p in prepared if p.chips.intent_mode == mode and not p.refused]
         if not items:
             print(f"\n§8.2 {mode.value}: no golden query uses this mode — left at the spec's values.")
             continue

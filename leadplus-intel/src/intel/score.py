@@ -29,7 +29,7 @@ from .models import (
     CompanyResult,
     Evidence,
     IntentMode,
-    Term,
+    TermGroup,
     TermSource,
 )
 from .retrieve import Retrieval
@@ -190,21 +190,43 @@ def _job_prose(job: dict[str, Any]) -> str:
     return job.get("paraphrase") or ""
 
 
-def job_matched_terms(job: dict[str, Any], terms: Sequence[Term], matcher: TermMatcher) -> list[str]:
-    """Which of the query's job-side terms this posting itself satisfies.
+def group_hits(
+    group: TermGroup, *, technologies: Sequence[str], prose: str, matcher: TermMatcher
+) -> list[str]:
+    """Which of a group's alternates match. **The group matches if ANY of them does** (§2).
 
-    Only `HIRING` and `ANY` terms are considered: a `USES` term is a claim about the company, and
-    a posting is not the evidence for it. Drives both `evidence[].matched_terms` and which
+    Returning the hits rather than a bool is what lets a card say *"AWS or Azure ✓ (AWS)"* — the
+    user asked a question with two acceptable answers and is owed the one that fired.
+    """
+    return [
+        alternate
+        for alternate in group.any_of
+        if alternate.strip()
+        and matcher.matches(alternate, technologies=technologies, prose=prose)
+    ]
+
+
+def job_matched_terms(
+    job: dict[str, Any], groups: Sequence[TermGroup], matcher: TermMatcher
+) -> list[str]:
+    """Which of the query's job-side alternates this posting itself satisfies.
+
+    Only `HIRING` and `ANY` groups are considered: a `USES` group is a claim about the company,
+    and a posting is not the evidence for it. Drives both `evidence[].matched_terms` and which
     postings count towards `recency`/`volume`.
     """
     out: list[str] = []
-    for term in terms:
-        if term.source == TermSource.USES:
+    for group in groups:
+        if group.source == TermSource.USES:
             continue
-        if matcher.matches(
-            term.value, technologies=job.get("technologies") or [], prose=_job_prose(job)
-        ):
-            out.append(term.value)
+        out.extend(
+            group_hits(
+                group,
+                technologies=job.get("technologies") or [],
+                prose=_job_prose(job),
+                matcher=matcher,
+            )
+        )
     return out
 
 
@@ -212,10 +234,10 @@ def coverage(
     *,
     company: dict[str, Any],
     jobs: Sequence[dict[str, Any]],
-    terms: Sequence[Term],
+    groups: Sequence[TermGroup],
     matcher: TermMatcher,
 ) -> tuple[float, list[str], list[str]]:
-    """§8.4 — the AND-ness, as a fraction, with no cliff.
+    """§8.4 + CHANGES-v2 §2/§10 — the AND-ness, as a fraction, with no cliff.
 
     This is defect #1's fix. The shipped system's `keywordMatchMode` defaults to `ANY` at three
     layers, so "Snowflake **and** AWS" silently means "Snowflake **or** AWS"; flipping it to
@@ -223,9 +245,22 @@ def coverage(
     of three. Coverage replaces the switch with a *ratio*: 3-of-3 scores 1.0, 1-of-3 scores 0.33,
     and both are returned, ordered. There is no mode to get wrong.
 
-    The haystack is chosen per term by `Term.source` (§8.4) — this is what makes "companies
-    **using** Snowflake" and "companies **hiring for** Snowflake" different questions rather than
-    two phrasings of one.
+    v2 makes the unit a **group** rather than a term:
+
+        coverage = matched_positive_groups / total_positive_groups
+
+    "SAP and also AWS or Azure" is 2 requirements, not 3 terms. A company with SAP+AWS covers 2/2
+    = 1.00; a company with AWS+Azure and no SAP covers 1/2 = 0.50 — which is right, because it
+    answered one of the two things asked, twice. Counting alternates would score it 2/3 and rank
+    it above a company that actually satisfied the whole query.
+
+    **Negated groups never enter the denominator** (§2): they are filters, not requirements, and
+    the rows they match are already gone. Including them would silently cap coverage below 1.0 for
+    every company on any query with an exclusion.
+
+    The haystack is chosen per group by `source` (§8.4) — this is what makes "companies **using**
+    Snowflake" and "companies **hiring for** Snowflake" different questions rather than two
+    phrasings of one.
     """
     company_tech = company.get("technologies") or []
     company_prose = company.get("paraphrase") or ""
@@ -237,22 +272,47 @@ def coverage(
         job_prose_parts.append(_job_prose(job))
     job_prose = " ".join(job_prose_parts)
 
+    positives = [g for g in groups if not g.negate and g.label]
+    if not positives:
+        # No requirement was stated, so no requirement went unmet — coverage is 1.0, not 0.0.
+        #
+        # This matters now in a way it did not in v1. `matched / max(1, asked)` silently yields
+        # 0.0 when `asked` is 0, and v1 had no way to express a query with no terms at all. §4
+        # creates them by the handful: "mid-market companies in Illinois or Ohio" is a complete,
+        # answerable question made entirely of facts. Reporting `coverage 0.00` on every one of
+        # its results claims each company matched nothing of what was asked — the opposite of the
+        # truth — and costs all of them 45% of their score for a question nobody asked.
+        #
+        # Same reasoning as `normalize_01`'s flat-list case: an axis carrying no information is
+        # 1.0 for everyone, because 0.0 would silently assert something false. The ranking is
+        # unaffected either way (a constant), but the number is read by humans.
+        return 1.0, [], []
+
     matched: list[str] = []
     unmatched: list[str] = []
-    for term in terms:
-        if term.source == TermSource.USES:
-            hit = matcher.matches(term.value, technologies=company_tech, prose=company_prose)
-        elif term.source == TermSource.HIRING:
-            hit = matcher.matches(term.value, technologies=job_tech, prose=job_prose)
+    for group in positives:
+        if group.source == TermSource.USES:
+            hits = group_hits(
+                group, technologies=company_tech, prose=company_prose, matcher=matcher
+            )
+        elif group.source == TermSource.HIRING:
+            hits = group_hits(group, technologies=job_tech, prose=job_prose, matcher=matcher)
         else:
-            hit = matcher.matches(
-                term.value,
+            hits = group_hits(
+                group,
                 technologies=[*company_tech, *job_tech],
                 prose=f"{company_prose} {job_prose}",
+                matcher=matcher,
             )
-        (matched if hit else unmatched).append(term.value)
+        if hits:
+            # Name the alternate that fired when the group offered a choice: `AWS or Azure (AWS)`.
+            matched.append(
+                group.label if len(group.any_of) == 1 else f"{group.label} ({', '.join(hits)})"
+            )
+        else:
+            unmatched.append(group.label)
 
-    return len(matched) / max(1, len(terms)), matched, unmatched
+    return len(matched) / max(1, len(positives)), matched, unmatched
 
 
 # ---------------------------------------------------------------------------
@@ -288,10 +348,11 @@ def industry_multiplier(
     *,
     industry_canonical: str | None,
     similarity: float | None,
-    asked: str | None,
+    asked: Sequence[str],
+    strict: bool,
     tuning: Tuning,
 ) -> tuple[float, str]:
-    """§8.5 — a soft multiplier, **never a filter**. Returns (multiplier, which rule fired).
+    """§8.5 + CHANGES-v2 §5/§10 — a soft multiplier by default. Returns (multiplier, rule fired).
 
     Rule 2's worked example. `industry` is free text: the company says "Industrial Machinery",
     the user says "manufacturing". Hard-filtering that string deletes the correct answer before
@@ -302,14 +363,32 @@ def industry_multiplier(
     The tiers: an exact canonical hit is 1.00; a close-but-not-equal industry (cosine > 0.82
     between the two industry strings' embeddings) keeps 0.75; anything else is down-weighted to
     0.35 — **and still returned**.
+
+    Two v2 changes:
+
+      * **`max()` across the asked list** (§10). "manufacturing or automotive" is one question with
+        two acceptable answers; charging a manufacturer for being a poor automotive match would
+        punish it for the user's own OR. The exact-hit tier is checked across the whole list first,
+        because `industry_similarity` from SQL is already the max cosine and a canonical hit must
+        outrank a cosine near-miss on a *different* asked value.
+      * **`strict` skips it entirely** (§5). The user said "strictly"/"only", so `industries`
+        became a hard filter in `build_filters` and every surviving company already satisfies it.
+        Multiplying as well would down-weight rows on an axis they were already filtered by — and
+        the 0.35 tier could never fire, because those rows are gone.
     """
     if not asked:
         return 1.00, "no industry asked"
-    if industry_canonical and industry_canonical.strip().lower() == asked.strip().lower():
+    if strict:
+        return 1.00, f"industry_strict: hard-filtered on {', '.join(asked)}, multiplier skipped"
+    wanted = {a.strip().lower() for a in asked if a.strip()}
+    if industry_canonical and industry_canonical.strip().lower() in wanted:
         return 1.00, f"canonical hit: {industry_canonical}"
     if similarity is not None and similarity > tuning.near_threshold:
-        return tuning.near_multiplier, f"near match: cosine {similarity:.3f} > {tuning.near_threshold}"
-    detail = f"cosine {similarity:.3f}" if similarity is not None else "no industry embedding"
+        return (
+            tuning.near_multiplier,
+            f"near match: best cosine {similarity:.3f} > {tuning.near_threshold}",
+        )
+    detail = f"best cosine {similarity:.3f}" if similarity is not None else "no industry embedding"
     return tuning.far_multiplier, f"down-weighted, not dropped ({detail})"
 
 
@@ -323,18 +402,26 @@ def rank(
     retrieval: Retrieval,
     chips: Chips,
     matcher: TermMatcher,
-    asked_industry: str | None,
+    asked_industries: Sequence[str],
     now: dt.datetime,
     limit: int = 20,
     tuning: Tuning | None = None,
+    excluded_by: dict[int, list[str]] | None = None,
 ) -> list[CompanyResult]:
     """§6[5]-[6] and §8.6: score every candidate, attach evidence, sort, cut to `limit`.
 
     The cut is the *only* place a company is removed for not being good enough, and it happens
     after ranking, at the caller's requested depth — never before it (rule 2).
+
+    `excluded_by` is passed when this is scoring the **excluded** set (CHANGES-v2 §10): the same
+    arithmetic runs over the companies a negated group removed, so each one can be shown with the
+    score it would have had and the group that deleted it. Scoring them with a different code path
+    would let the reported "would have ranked #1" drift from the ranking that would really have
+    happened.
     """
     tuning = tuning or Tuning.default()
     weights = tuning.weights[chips.intent_mode]
+    excluded_by = excluded_by or {}
 
     results: list[CompanyResult] = []
     for cid in retrieval.candidates:
@@ -347,20 +434,22 @@ def rank(
         jobs = retrieval.company_jobs.get(cid, [])
 
         cov, matched, unmatched = coverage(
-            company=detail, jobs=jobs, terms=chips.terms, matcher=matcher
+            company=detail, jobs=jobs, groups=chips.terms, matcher=matcher
         )
 
         # Which postings count as "matching" for recency/volume/evidence. §8.3 says
-        # "distinct_matching_roles", and a posting matches when it satisfies a job-side term.
-        # With no job-side terms to test (e.g. a pure USES query) every surviving posting counts
+        # "distinct_matching_roles", and a posting matches when it satisfies a job-side group.
+        # With no job-side groups to test (e.g. a pure USES query) every surviving posting counts
         # — there is nothing for it to fail.
-        job_side_terms = [t for t in chips.terms if t.source != TermSource.USES]
+        job_side_groups = [
+            g for g in chips.positive_groups() if g.source != TermSource.USES
+        ]
         per_job_matches: dict[int, list[str]] = {}
         matching_jobs: list[dict[str, Any]] = []
         for job in jobs:
-            hits = job_matched_terms(job, job_side_terms, matcher) if job_side_terms else []
+            hits = job_matched_terms(job, job_side_groups, matcher) if job_side_groups else []
             per_job_matches[job["job_id"]] = hits
-            if not job_side_terms or hits:
+            if not job_side_groups or hits:
                 matching_jobs.append(job)
 
         dates = [j["posted_date"] for j in matching_jobs if j.get("posted_date")]
@@ -378,7 +467,8 @@ def rank(
         multiplier, rule = industry_multiplier(
             industry_canonical=detail.get("industry_canonical"),
             similarity=detail.get("industry_similarity"),
-            asked=asked_industry,
+            asked=asked_industries,
+            strict=chips.industry_strict,
             tuning=tuning,
         )
         score = multiplier * subtotal
@@ -422,6 +512,11 @@ def rank(
                 industry_canonical=detail.get("industry_canonical"),
                 technologies=detail.get("technologies") or [],
                 paraphrase=detail.get("paraphrase") or "",
+                hq_city=detail.get("hq_city"),
+                hq_state=detail.get("hq_state"),
+                hq_country=detail.get("hq_country"),
+                segments=detail.get("segments") or [],
+                linkedin_url=detail.get("linkedin_url"),
                 score=score,
                 breakdown=Breakdown(
                     coverage=cov,
@@ -432,10 +527,11 @@ def rank(
                     weighted_subtotal=subtotal,
                     industry_multiplier=multiplier,
                     intent_mode=chips.intent_mode,
-                    matched_terms=matched,
-                    unmatched_terms=unmatched,
+                    matched_groups=matched,
+                    unmatched_groups=unmatched,
+                    excluded_by=excluded_by.get(cid, []),
                     matched_count=len(matched),
-                    asked_count=len(chips.terms),
+                    asked_count=len(chips.positive_groups()),
                     distinct_roles=distinct_roles,
                     days_since_latest_post=days_ago,
                     rrf_score=retrieval.fused.get(cid, 0.0),

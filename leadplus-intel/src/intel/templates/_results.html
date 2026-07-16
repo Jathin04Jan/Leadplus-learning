@@ -5,45 +5,128 @@
   <div class="note">{{ n }}</div>
 {% endfor %}
 
+{# ---------------------------------------------------------------------------
+   CHANGES-v2 §1 — a refusal is rendered AS a refusal.
+
+   This block is the whole point of §1. v1 answered "create a 3-step campaign" with three
+   confident companies and no indication anything had gone wrong. An empty <div> would be barely
+   better: the user cannot tell "nothing matched" from "I did not understand the question", and
+   only one of those is their fault to fix.
+   --------------------------------------------------------------------------- #}
+{% if r.refusal %}
+  <div class="refusal {{ 'action' if c.intent.value == 'ACTION' else 'unparseable' }}">
+    <div class="refusal-tag">{{ c.intent.value|lower }}</div>
+    <p class="refusal-msg">{{ r.refusal }}</p>
+    <p class="refusal-why">
+      {% if c.intent.value == 'ACTION' %}
+        Nothing was retrieved and <b>no companies are shown</b> — not because none matched, but
+        because this is not a search. Ask for companies and this app will answer; ask for a
+        campaign and it would only be guessing.
+      {% else %}
+        No filter could be extracted, so <b>nothing was retrieved</b>. Returning a ranked list
+        here would mean ranking the corpus against an empty question — which is exactly the bug
+        this app exists to prove is fixable. Name a technology, industry, place, size or segment.
+      {% endif %}
+    </p>
+  </div>
+  <div class="meta">
+    <span>0 companies · retrieval never ran</span>
+    <span class="timing">
+      {% for k, v in r.timing_ms.items() %}<code>{{ k }}={{ v }}</code>{% if not loop.last %} · {% endif %}{% endfor %}
+    </span>
+  </div>
+{% else %}
+
 <form class="panel" id="chips" hx-post="/ui/refine" hx-target="#results" hx-swap="innerHTML">
   <h2>Parsed query {% if llm_used %}· from the LLM{% else %}· edited by you{% endif %}</h2>
   <p class="hint">
     This is what the search actually ran. Wrong? Fix it here — edits re-run instantly and
-    <b>never call the LLM again</b>.
+    <b>never call the LLM again</b>. <b class="hard">Hard</b> chips delete companies;
+    everything else only re-ranks them.
   </p>
 
   <input type="hidden" name="q" value="{{ q }}">
   <input type="hidden" name="limit" value="20">
-  {# Preserved across refines even though the UI has no editor for them. #}
-  {% if c.min_employees is not none %}<input type="hidden" name="min_employees" value="{{ c.min_employees }}">{% endif %}
-  {% if c.max_employees is not none %}<input type="hidden" name="max_employees" value="{{ c.max_employees }}">{% endif %}
-  {% if c.min_revenue_usd is not none %}<input type="hidden" name="min_revenue_usd" value="{{ c.min_revenue_usd }}">{% endif %}
-  {% if c.max_revenue_usd is not none %}<input type="hidden" name="max_revenue_usd" value="{{ c.max_revenue_usd }}">{% endif %}
 
   <div class="chip-list" id="chip-list">
-    {% for t in c.terms %}
-      <span class="chip">
-        <input type="hidden" name="term_value" value="{{ t.value }}">
-        <span class="chip-label">{{ t.value }}</span>
-        <select name="term_source" onchange="rerun()" title="Which side of the corpus answers this term">
+    {% for g in c.terms %}
+      <span class="chip {{ 'negated' if g.negate }}">
+        <input type="hidden" name="group_any_of" value="{{ g.any_of|join(', ') }}">
+        <select name="group_negate" onchange="rerun()" title="Positive groups rank. Negated groups REMOVE.">
+          <option value="false" {% if not g.negate %}selected{% endif %}>+</option>
+          <option value="true" {% if g.negate %}selected{% endif %}>−</option>
+        </select>
+        <span class="chip-label">{{ g.any_of|join(' or ') }}</span>
+        <select name="group_source" onchange="rerun()" title="Which side of the corpus answers this group">
           {% for s in sources %}
-            <option value="{{ s }}" {% if t.source.value == s %}selected{% endif %}>
+            <option value="{{ s }}" {% if g.source.value == s %}selected{% endif %}>
               {{ {'USES': 'uses', 'HIRING': 'hiring for', 'ANY': 'either'}[s] }}
             </option>
           {% endfor %}
         </select>
-        <button type="button" class="x" onclick="removeChip(this)" title="Remove this term">×</button>
+        <button type="button" class="x" onclick="removeChip(this)" title="Remove this group">×</button>
       </span>
     {% else %}
       <span class="chip empty">no terms — ranking on the query's meaning alone</span>
+    {% endfor %}
+
+    {% for v in c.locations %}
+      <span class="chip loc {{ 'negated' if v.negate }}">
+        <input type="hidden" name="location_value" value="{{ v.value }}">
+        <select name="location_negate" onchange="rerun()">
+          <option value="false" {% if not v.negate %}selected{% endif %}>in</option>
+          <option value="true" {% if v.negate %}selected{% endif %}>not in</option>
+        </select>
+        <span class="chip-label">{{ v.value }}</span>
+        <span class="chip-kind" title="A place is a fact — this is a hard filter (§3.2)">hard</span>
+        <button type="button" class="x" onclick="removeChip(this)">×</button>
+      </span>
+    {% endfor %}
+
+    {% for v in c.industries %}
+      <span class="chip ind {{ 'negated' if v.negate }}">
+        <input type="hidden" name="industry_value" value="{{ v.value }}">
+        <select name="industry_negate" onchange="rerun()">
+          <option value="false" {% if not v.negate %}selected{% endif %}>in</option>
+          <option value="true" {% if v.negate %}selected{% endif %}>not in</option>
+        </select>
+        <span class="chip-label">{{ v.value }}</span>
+        <span class="chip-kind" title="{{ 'Hard filter — you asked for strictly' if (c.industry_strict or v.negate) else 'Soft multiplier (§8.5) — a near-miss industry is down-weighted, never dropped' }}">
+          {{ 'hard' if (c.industry_strict or v.negate) else 'soft' }}
+        </span>
+        <button type="button" class="x" onclick="removeChip(this)">×</button>
+      </span>
     {% endfor %}
   </div>
 
   <div class="fields">
     <div class="field">
-      <label title="A soft multiplier — never a filter">Industry (soft)</label>
-      <input type="text" name="industry" value="{{ c.industry or '' }}" onchange="rerun()"
+      <label title="'strictly' / 'only' turns the soft industry multiplier into a hard filter">Industry match</label>
+      <select name="industry_strict" onchange="rerun()">
+        <option value="false" {% if not c.industry_strict %}selected{% endif %}>soft (rank)</option>
+        <option value="true" {% if c.industry_strict %}selected{% endif %}>strict (filter)</option>
+      </select>
+    </div>
+    <div class="field">
+      <label title="HARD. Closed set: Enterprise | Mid-Market | SMB">Segments (hard)</label>
+      <input type="text" name="segments" value="{{ c.segments|join(', ') }}" onchange="rerun()"
              placeholder="any">
+    </div>
+    <div class="field">
+      <label title="HARD. A NULL check is exact.">LinkedIn (hard)</label>
+      <select name="has_linkedin" onchange="rerun()">
+        <option value="" {% if c.has_linkedin is none %}selected{% endif %}>any</option>
+        <option value="true" {% if c.has_linkedin is true %}selected{% endif %}>has a profile</option>
+        <option value="false" {% if c.has_linkedin is false %}selected{% endif %}>no profile</option>
+      </select>
+    </div>
+    <div class="field">
+      <label title="HARD. Array overlap on lead_company.naics_codes">NAICS (hard)</label>
+      <input type="text" name="naics" value="{{ c.naics|join(', ') }}" onchange="rerun()" placeholder="any">
+    </div>
+    <div class="field">
+      <label title="HARD. Array overlap on lead_company.sic_codes">SIC (hard)</label>
+      <input type="text" name="sic" value="{{ c.sic|join(', ') }}" onchange="rerun()" placeholder="any">
     </div>
     <div class="field">
       <label title="A hard filter on posted_date — a fact">Posted within (days)</label>
@@ -77,11 +160,34 @@
       </select>
     </div>
     <div class="field">
-      <label>Add a term</label>
+      <label title="HARD. Firmographic facts.">Employees (hard)</label>
       <div class="add-term">
-        <input type="text" id="new-term" placeholder="e.g. Kafka"
-               onkeydown="if(event.key==='Enter'){event.preventDefault();addTerm();}">
-        <button type="button" class="ghost" onclick="addTerm()">+</button>
+        <input type="number" name="min_employees" class="tiny" placeholder="min" onchange="rerun()"
+               value="{{ c.min_employees if c.min_employees is not none else '' }}">
+        <input type="number" name="max_employees" class="tiny" placeholder="max" onchange="rerun()"
+               value="{{ c.max_employees if c.max_employees is not none else '' }}">
+      </div>
+    </div>
+    <div class="field">
+      <label title="HARD. Firmographic facts, in USD.">Revenue USD (hard)</label>
+      <div class="add-term">
+        <input type="number" name="min_revenue_usd" class="tiny" placeholder="min" onchange="rerun()"
+               value="{{ c.min_revenue_usd if c.min_revenue_usd is not none else '' }}">
+        <input type="number" name="max_revenue_usd" class="tiny" placeholder="max" onchange="rerun()"
+               value="{{ c.max_revenue_usd if c.max_revenue_usd is not none else '' }}">
+      </div>
+    </div>
+    <div class="field">
+      <label>Add a chip</label>
+      <div class="add-term">
+        <select id="new-kind">
+          <option value="group">term</option>
+          <option value="location">location</option>
+          <option value="industry">industry</option>
+        </select>
+        <input type="text" id="new-term" placeholder="e.g. Kafka, or Kafka or Pulsar"
+               onkeydown="if(event.key==='Enter'){event.preventDefault();addChip();}">
+        <button type="button" class="ghost" onclick="addChip()">+</button>
       </div>
     </div>
   </div>
@@ -103,9 +209,45 @@
 
 {% if not r.companies %}
   <div class="empty-state">
-    No companies retrieved. Widen the date window or remove a filter — note that terms never
-    filter, so an empty result means the hard filters excluded everything.
+    No companies retrieved. Widen the date window or remove a <b class="hard">hard</b> chip —
+    positive terms never filter, so an empty result means a hard filter excluded everything.
   </div>
+{% endif %}
+
+{# ---------------------------------------------------------------------------
+   CHANGES-v2 §10 — **an exclusion the user cannot see is one they cannot trust.**
+
+   Each of these was removed by a negated group. They are shown with the score and coverage they
+   *would* have had, computed by the same `score.rank()` that ranked the results above, so
+   "would have ranked #1 at coverage 1.00" is a measurement rather than a claim.
+   --------------------------------------------------------------------------- #}
+{% if r.excluded %}
+  <details class="excluded-panel">
+    <summary>
+      <b>{{ r.excluded|length }}</b> compan{{ 'y' if r.excluded|length == 1 else 'ies' }} removed by
+      your exclusion{{ 's' if c.terms|selectattr('negate')|list|length != 1 }} — see what and why
+    </summary>
+    <p class="hint">
+      Negation is the one place a term is allowed to delete a row (§2.1). These are the companies
+      it deleted, with the rank they would otherwise have held. It matches the
+      <b>canonical technology list only</b> — never the prose — so asking to exclude
+      <code>SAP</code> can never silently delete <code>Sapient</code> by substring.
+    </p>
+    {% for co in r.excluded %}
+      {% set b = co.breakdown %}
+      <div class="job excluded-row">
+        <div class="job-head">
+          <span class="job-title">{{ co.name or 'company ' ~ co.company_id }}</span>
+          {% for x in b.excluded_by %}<span class="tag neg">{{ x }}</span>{% endfor %}
+          <span class="job-date">
+            {%- if b.would_rank %}would have ranked #{{ b.would_rank }} · {% endif -%}
+            score {{ '%.3f'|format(co.score) }} · coverage {{ '%.2f'|format(b.coverage) }}
+          </span>
+        </div>
+        <p class="job-para">{{ co.technologies|join(' · ') }}</p>
+      </div>
+    {% endfor %}
+  </details>
 {% endif %}
 
 {% for co in r.companies %}
@@ -117,7 +259,9 @@
         <p class="card-sub">
           {{ co.industry_canonical or co.industry_raw or 'industry unknown' }}
           {%- if co.domain %} · {{ co.domain }}{% endif %}
-          · {{ b.matched_count }}/{{ b.asked_count }} terms
+          {%- if b.asked_count %} · {{ b.matched_count }}/{{ b.asked_count }} group{{ 's' if b.asked_count != 1 }}{% endif %}
+          {%- if co.hq_state %} · {{ co.hq_city ~ ', ' if co.hq_city }}{{ co.hq_state }}{% endif %}
+          {%- if co.segments %} · {{ co.segments|join('/') }}{% endif %}
           {%- if b.distinct_roles %} · {{ b.distinct_roles }} distinct role{{ 's' if b.distinct_roles != 1 }}{% endif %}
           {%- if b.days_since_latest_post is not none %} · last posted {{ b.days_since_latest_post }}d ago{% endif %}
         </p>
@@ -130,10 +274,10 @@
 
     <p class="company-para">{{ co.paraphrase }}</p>
 
-    {% if b.matched_terms or b.unmatched_terms %}
+    {% if b.matched_groups or b.unmatched_groups %}
       <div class="terms">
-        {% for t in b.matched_terms %}<span class="tag hit">✓ {{ t }}</span>{% endfor %}
-        {% for t in b.unmatched_terms %}<span class="tag miss">{{ t }}</span>{% endfor %}
+        {% for t in b.matched_groups %}<span class="tag hit">✓ {{ t }}</span>{% endfor %}
+        {% for t in b.unmatched_groups %}<span class="tag miss">{{ t }}</span>{% endfor %}
       </div>
     {% endif %}
 
@@ -194,3 +338,5 @@
     {% endif %}
   </div>
 {% endfor %}
+
+{% endif %}{# /r.refusal #}

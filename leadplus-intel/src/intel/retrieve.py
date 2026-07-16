@@ -25,13 +25,18 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 import psycopg
 
 from . import embed, repository
-from .canonicalize import tech_key
-from .models import Chips, IntentMode, TermSource
+from .canonicalize import location_key, tech_key
+from .models import Chips, IntentMode, TermGroup, TermSource, Value
+
+if TYPE_CHECKING:  # pragma: no cover — import only for the type, never at runtime.
+    # score.py imports Retrieval from this module, so importing score here for real would be a
+    # cycle. The matcher is passed in by the caller (main.py builds it once per request anyway).
+    from .score import TermMatcher
 
 log = logging.getLogger(__name__)
 
@@ -62,23 +67,32 @@ def _and_join(values: Sequence[str]) -> str:
     return f"{', '.join(items[:-1])} and {items[-1]}"
 
 
-def bucket_terms(chips: Chips) -> tuple[list[str], list[str], list[str]]:
-    """Split terms into (uses, hiring, unassigned) by `Term.source`, resolving ANY by intent.
+def _or_join(values: Sequence[str]) -> str:
+    """`[AWS, Azure]` -> `AWS or Azure`. A group's alternates, as English (CHANGES-v2 §2)."""
+    return " or ".join(v for v in values if v)
 
-    A term whose source is ANY has no side of its own, so the intent mode decides which side the
+
+def bucket_terms(chips: Chips) -> tuple[list[str], list[str], list[str]]:
+    """Split the POSITIVE groups into (uses, hiring, unassigned) by source, resolving ANY by intent.
+
+    A group whose source is ANY has no side of its own, so the intent mode decides which side the
     *paraphrase* should read as. This only shapes the text we embed — §8.4 still checks an ANY
-    term against the union of both haystacks, so nothing is narrowed here.
+    group against the union of both haystacks, so nothing is narrowed here.
+
+    Negated groups are absent by construction: they are filters (§2.1), and the retrieval SQL has
+    already removed everything they match. Writing "not on S/4HANA" into the text we embed would
+    move the query vector *towards* S/4HANA documents — embeddings have no `NOT`.
     """
     uses: list[str] = []
     hiring: list[str] = []
     unassigned: list[str] = []
-    for term in chips.terms:
-        value = term.value.strip()
+    for group in chips.positive_groups():
+        value = _or_join([v.strip() for v in group.any_of])
         if not value:
             continue
-        if term.source == TermSource.USES:
+        if group.source == TermSource.USES:
             uses.append(value)
-        elif term.source == TermSource.HIRING:
+        elif group.source == TermSource.HIRING:
             hiring.append(value)
         elif chips.intent_mode == IntentMode.USES:
             uses.append(value)
@@ -87,6 +101,14 @@ def bucket_terms(chips: Chips) -> tuple[list[str], list[str], list[str]]:
         else:
             unassigned.append(value)
     return uses, hiring, unassigned
+
+
+def positive_values(values: Sequence[Value]) -> list[str]:
+    return [v.value.strip() for v in values if not v.negate and v.value.strip()]
+
+
+def negated_values(values: Sequence[Value]) -> list[str]:
+    return [v.value.strip() for v in values if v.negate and v.value.strip()]
 
 
 def query_paraphrase(chips: Chips) -> str:
@@ -111,7 +133,8 @@ def query_paraphrase(chips: Chips) -> str:
     """
     uses, hiring, unassigned = bucket_terms(chips)
 
-    subject = f"{chips.industry.strip()} company" if chips.industry else "Company"
+    industries = positive_values(chips.industries)
+    subject = f"{_or_join(industries)} company" if industries else "Company"
     clauses: list[str] = []
     if uses:
         clauses.append(f"running {_and_join(uses)}")
@@ -119,6 +142,14 @@ def query_paraphrase(chips: Chips) -> str:
         clauses.append(f"hiring for {_and_join(hiring)}")
     if unassigned:
         clauses.append(f"working with {_and_join(unassigned)}")
+
+    # §3 — the corpus's company paraphrases name the place ("Mid-size industrial machinery
+    # manufacturer in Ohio running SAP ECC…"), so the query says it the same way (rule 4). This
+    # cannot widen the result set: `locations` is already a hard filter and every retrieved row
+    # satisfies it. It only helps the cosine order *within* the surviving set.
+    locations = positive_values(chips.locations)
+    if locations:
+        clauses.append(f"based in {_or_join(locations)}")
 
     role = " ".join(
         part
@@ -146,26 +177,177 @@ def query_paraphrase(chips: Chips) -> str:
 def chip_phrases(chips: Chips) -> list[str]:
     """The phrases the lexical lists OR together (§6[3a]).
 
-    The terms and the industry — the content words. Deduped, order-stable, so the assembled
-    tsquery is byte-identical for identical chips.
+    The positive groups' alternates and the positive industries — the content words. Deduped,
+    order-stable, so the assembled tsquery is byte-identical for identical chips.
 
-    Note the industry IS a lexical phrase while remaining a non-filter: contributing to a rank is
-    not the same as removing a row (rule 2). A company in the wrong industry still retrieves; it
-    is §8.5 that down-weights it, and even then it is never dropped.
+    Every alternate of a group is its own phrase. The lists are candidate *generators* and they
+    already OR everything (see `_TSQUERY_CTE`'s note); it is coverage that knows `AWS or Azure` is
+    one requirement rather than two, and coverage runs later, in Python.
+
+    Negated groups are excluded: their rows are gone, so a phrase for them could only pull in
+    *other* rows that happen to mention the excluded thing.
+
+    Note the industry IS a lexical phrase while remaining a non-filter by default: contributing to
+    a rank is not the same as removing a row (rule 2). A company in the wrong industry still
+    retrieves; §8.5 down-weights it, and even then it is never dropped — unless the user asked for
+    `industry_strict`, which is their explicit override (§5).
     """
-    phrases = [t.value.strip() for t in chips.terms if t.value.strip()]
-    if chips.industry and chips.industry.strip():
-        phrases.append(chips.industry.strip())
+    phrases = [v.strip() for g in chips.positive_groups() for v in g.any_of if v.strip()]
+    phrases.extend(positive_values(chips.industries))
     return list(dict.fromkeys(phrases))
 
 
-def hard_filters(chips: Chips) -> dict[str, Any]:
+def canonical_industries(conn: psycopg.Connection, values: Sequence[Value]) -> list[Value]:
+    """Map each asked industry onto the §5.5 vocabulary, or leave it alone.
+
+    §8.5's first tier is `company.industry_canonical == asked_industry` — a string equality, so
+    the two sides have to be spelled the same way. `company_signal.industry_canonical` holds a
+    value from `lead_query WHERE type='COMPANY_INDUSTRY'`; a user (or an eval file) types
+    "manufacturing". Without this step the equality never fires and every company falls to the
+    0.35 tier, which would look like the multiplier is broken. With `industry_strict` it matters
+    far more than that: the equality is a *filter*, so a spelling miss returns zero rows.
+
+    Deliberately exact-match only (punctuation-and-case-insensitive), with no embedding fallback:
+    this runs inside `/api/search/structured`, which must stay deterministic and network-free.
+    A near-miss that this does not resolve is not lost — it is precisely what §8.5's cosine tier
+    is for, and that comparison happens in SQL against the stored `industry_embedding`.
+    """
+    if not values:
+        return []
+    vocabulary = {tech_key(v): v for v in repository.fetch_industry_vocabulary(conn)}
+    out: list[Value] = []
+    for value in values:
+        asked = value.value.strip()
+        if not asked:
+            continue
+        out.append(value.model_copy(update={"value": vocabulary.get(tech_key(asked), asked)}))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# §6[2] — the predicate. CHANGES-v2 §2.1/§3.2/§4/§5 all land here.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Predicate:
+    """The SQL parameters for one query, plus what had to be said out loud to build them.
+
+    `shadow` is `filters` with the negation cleared. It exists for §10's `excluded_by`: the only
+    way to report *which companies a negated group removed* is to know which ones would have been
+    retrieved without it. Built here rather than in `retrieve()` so the two dicts cannot drift.
+    """
+
+    filters: dict[str, Any]
+    shadow: dict[str, Any]
+    negated: list[TermGroup]  # canonicalised — `any_of` holds `tech_canonical` terms
+    notes: list[str] = field(default_factory=list)
+
+
+def _canonical_negated(
+    chips: Chips, matcher: "TermMatcher"
+) -> tuple[list[TermGroup], list[str]]:
+    """Resolve each negated alternate against `tech_canonical` — §2.1's guard rail, in Python.
+
+    The SQL negates with `technologies && ARRAY[...]`, i.e. **exact element equality against the
+    controlled vocabulary**. So "exclude S/4HANA" has to arrive spelled `SAP S/4HANA`, the way the
+    array holds it, or the exclusion is a silent no-op.
+
+    A term that resolves to nothing is passed through verbatim and **reported**. It cannot match
+    the array, so it removes nothing — and that is the correct failure: the alternative is falling
+    back to a substring match, which is precisely the `LIKE '%sap%'` that deletes Sapient. A
+    no-op the user is told about beats a deletion they cannot see (§2.1). The note reaches the
+    response and the UI.
+    """
+    out: list[TermGroup] = []
+    notes: list[str] = []
+    for group in chips.negated_groups():
+        resolved: list[str] = []
+        for alternate in group.any_of:
+            alternate = alternate.strip()
+            if not alternate:
+                continue
+            canonical = matcher.resolve(alternate)
+            if canonical is None:
+                notes.append(
+                    f"cannot exclude {alternate!r}: it is not a known technology, and §2.1 forbids "
+                    f"matching a negation against prose (a substring NOT would delete 'Sapient' "
+                    f"for 'SAP'). Nothing was removed for this term."
+                )
+                log.warning("unresolvable negation term: %r", alternate)
+                resolved.append(alternate)
+            else:
+                resolved.append(canonical)
+        if resolved:
+            out.append(group.model_copy(update={"any_of": resolved}))
+    return out, notes
+
+
+def _expand_locations(
+    conn: psycopg.Connection, values: Sequence[str]
+) -> tuple[list[str], list[str]]:
+    """Raw location text -> canonical values, via `location_alias` (§3.1).
+
+    Unknown text is passed through lowercased rather than dropped, and reported. Dropping it would
+    turn "manufacturers in Wakanda" into "manufacturers" — 301 confident results for a question
+    with no answer, which is §1's disease. Passing it through returns an honest zero.
+    """
+    if not values:
+        return [], []
+    keys = [location_key(v) for v in values]
+    resolved = {r["alias"]: r["canonical"] for r in repository.expand_locations(conn, keys)}
+    out: list[str] = []
+    notes: list[str] = []
+    for raw, key in zip(values, keys):
+        canonical = resolved.get(key)
+        if canonical is None:
+            notes.append(
+                f"unknown location {raw!r}: not in `location_alias`, so it was matched literally "
+                f"and will return nothing. Re-seed with scripts/bootstrap_locations.py if it is real."
+            )
+            out.append(key)
+        else:
+            out.append(canonical)
+    return sorted(set(out)), notes
+
+
+def build_filters(
+    conn: psycopg.Connection, chips: Chips, matcher: "TermMatcher"
+) -> Predicate:
     """§6[2] — the only stage permitted to remove a candidate. Facts, and nothing else.
 
-    `industry` is deliberately not here (rule 2). Neither are terms. `function`/`seniority` are
-    here but scope the *job evidence set*, not the company set — see the note in `retrieve`.
+    What is here and why it is allowed to be (rule 2 / CHANGES-v2 §12):
+
+      * `posted_date`, employees, revenue — the original three. Facts.
+      * `locations` (§3.2)   — a state is a fact. Expanded through `location_alias` first.
+      * `segments`/`naics`/`sic`/`has_linkedin` (§4) — facts on `lead_company`. A NULL check is
+        exact; there is nothing fuzzy to get wrong.
+      * negated groups (§2.1) — canonical `technologies[]` only. **Never** prose.
+      * `industries` — ONLY when `industry_strict`, or when a value is negated (§5). Otherwise the
+        list is absent from here entirely and lives in §8.5's multiplier, because `industry` is
+        free text and hard-filtering free text silently deletes correct answers.
+
+    `function`/`seniority` are in the dict but scope the *job evidence set*, not the company set —
+    see the note in `retrieve()`.
+
+    Every array is `sorted(set(...))`: these become SQL parameters, and an unstable parameter
+    order would make identical chips produce a different query string on a re-run.
     """
-    return {
+    negated, notes = _canonical_negated(chips, matcher)
+
+    neg_uses = sorted(
+        {a for g in negated if g.source in (TermSource.USES, TermSource.ANY) for a in g.any_of}
+    )
+    neg_hiring = sorted(
+        {a for g in negated if g.source in (TermSource.HIRING, TermSource.ANY) for a in g.any_of}
+    )
+
+    loc_pos, pos_notes = _expand_locations(conn, positive_values(chips.locations))
+    loc_neg, neg_notes = _expand_locations(conn, negated_values(chips.locations))
+    notes.extend(pos_notes)
+    notes.extend(neg_notes)
+
+    filters: dict[str, Any] = {
         "since_days": chips.since_days,
         "function": chips.function.value if chips.function else None,
         "seniority": chips.seniority.value if chips.seniority else None,
@@ -173,30 +355,25 @@ def hard_filters(chips: Chips) -> dict[str, Any]:
         "max_employees": chips.max_employees,
         "min_revenue_usd": chips.min_revenue_usd,
         "max_revenue_usd": chips.max_revenue_usd,
+        "loc_pos": loc_pos,
+        "loc_neg": loc_neg,
+        "segments": sorted({s.strip() for s in chips.segments if s.strip()}),
+        "naics": sorted({s.strip() for s in chips.naics if s.strip()}),
+        "sic": sorted({s.strip() for s in chips.sic if s.strip()}),
+        "has_linkedin": chips.has_linkedin,
+        # §5: the positives are a filter ONLY on the user's explicit "strictly"/"only".
+        "industry_pos": (
+            sorted({v.lower() for v in positive_values(chips.industries)})
+            if chips.industry_strict
+            else []
+        ),
+        # §5: "negated values -> always hard". "not pharma" is an instruction, not a preference.
+        "industry_neg": sorted({v.lower() for v in negated_values(chips.industries)}),
+        "neg_uses": neg_uses,
+        "neg_hiring": neg_hiring,
     }
-
-
-def canonical_industry(conn: psycopg.Connection, asked: str | None) -> str | None:
-    """Map the asked industry onto the §5.5 vocabulary, or leave it alone.
-
-    §8.5's first tier is `company.industry_canonical == asked_industry` — a string equality, so
-    the two sides have to be spelled the same way. `company_signal.industry_canonical` holds a
-    value from `lead_query WHERE type='COMPANY_INDUSTRY'`; a user (or an eval file) types
-    "manufacturing". Without this step the equality never fires and every company falls to the
-    0.35 tier, which would look like the multiplier is broken.
-
-    Deliberately exact-match only (punctuation-and-case-insensitive), with no embedding fallback:
-    this runs inside `/api/search/structured`, which must stay deterministic and network-free.
-    A near-miss that this does not resolve is not lost — it is precisely what §8.5's cosine tier
-    is for, and that comparison happens in SQL against the stored `industry_embedding`.
-    """
-    if not asked or not asked.strip():
-        return None
-    wanted = tech_key(asked)
-    for value in repository.fetch_industry_vocabulary(conn):
-        if tech_key(value) == wanted:
-            return value
-    return asked.strip()
+    shadow = {**filters, "neg_uses": [], "neg_hiring": []}
+    return Predicate(filters=filters, shadow=shadow, negated=negated, notes=notes)
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +385,7 @@ def canonical_industry(conn: psycopg.Connection, asked: str | None) -> str | Non
 class QueryVectors:
     paraphrase: str
     qvec: list[float]
-    industry_vec: list[float] | None
+    industry_vecs: list[list[float]]
 
 
 _VEC_CACHE: dict[str, list[float]] = {}
@@ -227,17 +404,25 @@ async def _embed_cached(text: str) -> list[float]:
 
 
 async def prepare(chips: Chips) -> QueryVectors:
-    """Build the query paraphrase and its vector(s). The only await in the retrieval path."""
+    """Build the query paraphrase and its vector(s). The only await in the retrieval path.
+
+    One vector per *positive* asked industry, because §10 takes `max()` across the list. Negated
+    industries get none: they are a hard filter (§5), and their rows are gone before §8.5 looks.
+
+    With `industry_strict` the multiplier is skipped entirely (§5) — but the vectors are still
+    built, because `industry_similarity` is reported in the `Breakdown` either way and a number
+    the user can see is how they check that "strictly" did what they meant.
+    """
     paraphrase = query_paraphrase(chips)
     qvec = await _embed_cached(paraphrase)
-    industry_vec = None
-    if chips.industry and chips.industry.strip():
+    industry_vecs: list[list[float]] = []
+    for value in positive_values(chips.industries):
         # §8.5 compares emb(company.industry_raw) to emb(asked_industry). The company side was
         # embedded at ingest from the bare industry string, so the query side must be the bare
         # string too — embedding "Manufacturing company running SAP" here instead would be
         # comparing two different things and the 0.82 threshold would mean nothing.
-        industry_vec = await _embed_cached(chips.industry.strip())
-    return QueryVectors(paraphrase=paraphrase, qvec=qvec, industry_vec=industry_vec)
+        industry_vecs.append(await _embed_cached(value))
+    return QueryVectors(paraphrase=paraphrase, qvec=qvec, industry_vecs=industry_vecs)
 
 
 # ---------------------------------------------------------------------------
@@ -316,32 +501,43 @@ class Retrieval:
     retrieved_job_ids: dict[int, set[int]]
     details: dict[int, dict[str, Any]]
     list_sizes: dict[str, int] = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
+
+    # CHANGES-v2 §10 — the *un-negated* retrieval: what would have been returned had the query
+    # not excluded anything. None when nothing was negated. Scoring this whole set is what lets an
+    # exclusion be reported as "would have ranked #1" rather than "was removed, trust me".
+    excluded: "Retrieval | None" = None
+    # The subset of `excluded`'s candidates that the negation actually removed.
+    excluded_ids: list[int] = field(default_factory=list)
+    excluded_by: dict[int, list[str]] = field(default_factory=dict)
 
     @property
     def candidates(self) -> list[int]:
         return sorted(self.fused)
 
 
-def retrieve(conn: psycopg.Connection, chips: Chips, vectors: QueryVectors) -> Retrieval:
-    """§6 steps [2]-[4]. Pure SQL and arithmetic; deterministic; no LLM.
-
-    On `function`/`seniority`: §6[1] puts them in `Chips` but §6[2] does not list them as hard
-    filters, and rule 2's reasoning tells you why the distinction matters — they are LLM-inferred
-    enums, not facts like `posted_date`. So they scope the **job document set** (the lists, and
-    equally the evidence, recency and volume computed from it) and never the company set. Ask for
-    "manufacturers hiring data engineers" and a company whose only DATA_ENGINEERING posting is
-    old still appears through the company lists, with `recency` 0.0 — down-weighted, not deleted,
-    exactly as rule 2 requires.
-    """
-    filters = hard_filters(chips)
-    phrases = chip_phrases(chips)
-
-    # [3] Four lists, top 200 each. The two job lists share one filtered survivor set; the two
+def _fuse(
+    conn: psycopg.Connection,
+    *,
+    phrases: Sequence[str],
+    qvec: Sequence[float],
+    filters: dict[str, Any],
+) -> tuple[dict[int, float], dict[int, float], dict[int, int], dict[str, int]]:
+    """§6[3]-[4] — the four lists and their fusion, for one set of filters."""
+    # Four lists, top 200 each. The two job lists share one filtered survivor set; the two
     # company lists share the other (no date filter — companies have no posted_date, §6[3b]).
-    job_lex = repository.search_jobs_lexical(conn, phrases=phrases, filters=filters, limit=LIST_DEPTH) if phrases else []
-    job_sem = repository.search_jobs_semantic(conn, qvec=vectors.qvec, filters=filters, limit=LIST_DEPTH)
-    com_lex = repository.search_companies_lexical(conn, phrases=phrases, filters=filters, limit=LIST_DEPTH) if phrases else []
-    com_sem = repository.search_companies_semantic(conn, qvec=vectors.qvec, filters=filters, limit=LIST_DEPTH)
+    job_lex = (
+        repository.search_jobs_lexical(conn, phrases=phrases, filters=filters, limit=LIST_DEPTH)
+        if phrases
+        else []
+    )
+    job_sem = repository.search_jobs_semantic(conn, qvec=qvec, filters=filters, limit=LIST_DEPTH)
+    com_lex = (
+        repository.search_companies_lexical(conn, phrases=phrases, filters=filters, limit=LIST_DEPTH)
+        if phrases
+        else []
+    )
+    com_sem = repository.search_companies_semantic(conn, qvec=qvec, filters=filters, limit=LIST_DEPTH)
 
     job_to_company: dict[int, int] = {}
     for row in (*job_lex, *job_sem):
@@ -356,36 +552,147 @@ def retrieve(conn: psycopg.Connection, chips: Chips, vectors: QueryVectors) -> R
     l4 = _ranks(com_sem, "company_id")
 
     fused = rrf(l1, l2, l3, l4)
-    best_doc = normalize_01(fused)
+    sizes = {
+        "job_lexical": len(job_lex),
+        "job_semantic": len(job_sem),
+        "company_lexical": len(com_lex),
+        "company_semantic": len(com_sem),
+        "candidates": len(fused),
+    }
+    return fused, normalize_01(fused), job_to_company, sizes
 
-    candidates = sorted(fused)
 
+def _hydrate(
+    conn: psycopg.Connection,
+    *,
+    company_ids: Sequence[int],
+    fused: dict[int, float],
+    best_doc: dict[int, float],
+    job_to_company: dict[int, int],
+    filters: dict[str, Any],
+    vectors: QueryVectors,
+    list_sizes: dict[str, int],
+) -> Retrieval:
+    """Attach the scoring inputs — details, jobs, evidence — for a candidate set."""
+    wanted = set(company_ids)  # hoisted: rebuilding this per job is O(jobs x candidates)
     retrieved_job_ids: dict[int, set[int]] = defaultdict(set)
     for job_id, cid in job_to_company.items():
-        retrieved_job_ids[cid].add(job_id)
+        if cid in wanted:
+            retrieved_job_ids[cid].add(job_id)
 
     details = {
         row["company_id"]: row
         for row in repository.fetch_company_details(
-            conn, company_ids=candidates, industry_vec=vectors.industry_vec
+            conn, company_ids=company_ids, industry_vecs=vectors.industry_vecs
         )
     }
-
     company_jobs: dict[int, list[dict[str, Any]]] = defaultdict(list)
-    for row in repository.fetch_jobs_for_companies(conn, company_ids=candidates, filters=filters):
+    for row in repository.fetch_jobs_for_companies(conn, company_ids=company_ids, filters=filters):
         company_jobs[row["company_id"]].append(row)
 
     return Retrieval(
-        fused=fused,
-        best_doc=best_doc,
+        fused={cid: fused[cid] for cid in company_ids if cid in fused},
+        best_doc={cid: best_doc[cid] for cid in company_ids if cid in best_doc},
         company_jobs=dict(company_jobs),
         retrieved_job_ids=dict(retrieved_job_ids),
         details=details,
-        list_sizes={
-            "job_lexical": len(job_lex),
-            "job_semantic": len(job_sem),
-            "company_lexical": len(com_lex),
-            "company_semantic": len(com_sem),
-            "candidates": len(candidates),
-        },
+        list_sizes=list_sizes,
     )
+
+
+def attribute_exclusions(
+    conn: psycopg.Connection, *, company_ids: Sequence[int], negated: Sequence[TermGroup]
+) -> dict[int, list[str]]:
+    """Which negated group removed each company — §10's `excluded_by`.
+
+    Mirrors `_FACT_FILTERS`'s two `NOT EXISTS` clauses exactly: the same canonical arrays, the
+    same source routing, the same exact equality. It has to, or the explanation would be able to
+    disagree with the filter that produced it — and an explanation that can lie about a removal is
+    worse than none.
+    """
+    if not company_ids or not negated:
+        return {}
+    rows = repository.fetch_company_technology_sets(conn, company_ids=company_ids)
+    out: dict[int, list[str]] = {}
+    for row in rows:
+        uses = {t.lower() for t in row["uses_technologies"] or []}
+        hiring = {t.lower() for t in row["hiring_technologies"] or []}
+        fired: list[str] = []
+        for group in negated:
+            hay = set()
+            if group.source in (TermSource.USES, TermSource.ANY):
+                hay |= uses
+            if group.source in (TermSource.HIRING, TermSource.ANY):
+                hay |= hiring
+            hit = [a for a in group.any_of if a.lower() in hay]
+            if hit:
+                fired.append(f"NOT {_or_join(hit)}" if len(hit) < len(group.any_of) else f"NOT {group.label}")
+        if fired:
+            out[row["company_id"]] = fired
+    return out
+
+
+def retrieve(
+    conn: psycopg.Connection, chips: Chips, vectors: QueryVectors, matcher: "TermMatcher"
+) -> Retrieval:
+    """§6 steps [2]-[4]. Pure SQL and arithmetic; deterministic; no LLM.
+
+    On `function`/`seniority`: §6[1] puts them in `Chips` but §6[2] does not list them as hard
+    filters, and rule 2's reasoning tells you why the distinction matters — they are LLM-inferred
+    enums, not facts like `posted_date`. So they scope the **job document set** (the lists, and
+    equally the evidence, recency and volume computed from it) and never the company set. Ask for
+    "manufacturers hiring data engineers" and a company whose only DATA_ENGINEERING posting is
+    old still appears through the company lists, with `recency` 0.0 — down-weighted, not deleted,
+    exactly as rule 2 requires.
+
+    On the shadow run (CHANGES-v2 §10): when the query negates something, the four lists run a
+    second time with the negation cleared. The difference between the two candidate sets is
+    exactly "the companies the exclusion removed", and each is scored and returned in
+    `excluded` with the rank it would have held. It costs four more SQL queries over 687 rows,
+    only when a negation exists — and it is what turns "trust me, I removed something" into
+    "here is what I removed, here is what it would have scored, and here is the group that did it".
+    """
+    predicate = build_filters(conn, chips, matcher)
+    phrases = chip_phrases(chips)
+
+    fused, best_doc, job_to_company, sizes = _fuse(
+        conn, phrases=phrases, qvec=vectors.qvec, filters=predicate.filters
+    )
+    retrieval = _hydrate(
+        conn,
+        company_ids=sorted(fused),
+        fused=fused,
+        best_doc=best_doc,
+        job_to_company=job_to_company,
+        filters=predicate.filters,
+        vectors=vectors,
+        list_sizes=sizes,
+    )
+    retrieval.notes = list(predicate.notes)
+
+    if predicate.negated:
+        s_fused, s_best, s_j2c, s_sizes = _fuse(
+            conn, phrases=phrases, qvec=vectors.qvec, filters=predicate.shadow
+        )
+        removed = sorted(set(s_fused) - set(fused))
+        if removed:
+            # Hydrate the WHOLE shadow set, not just the removed rows. `best_doc` is a min-max
+            # normalisation over the candidate set it was computed from, and a rank is a position
+            # within a list — both are meaningless in a subset. Scoring the full un-negated set is
+            # the only way "would have ranked #1" is a measurement rather than a guess.
+            retrieval.excluded = _hydrate(
+                conn,
+                company_ids=sorted(s_fused),
+                fused=s_fused,
+                best_doc=s_best,
+                job_to_company=s_j2c,
+                filters=predicate.shadow,
+                vectors=vectors,
+                list_sizes=s_sizes,
+            )
+            retrieval.excluded_ids = removed
+            retrieval.excluded_by = attribute_exclusions(
+                conn, company_ids=removed, negated=predicate.negated
+            )
+
+    return retrieval

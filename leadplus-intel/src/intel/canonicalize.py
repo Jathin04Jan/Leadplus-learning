@@ -123,6 +123,19 @@ def tech_key(term: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (term or "").lower())
 
 
+def location_key(value: str) -> str:
+    """The `location_alias.alias` key: lowercased, whitespace-collapsed (CHANGES-v2 §3.1).
+
+    Deliberately NOT `tech_key`. Stripping punctuation there is right because `S/4HANA` and
+    `S4HANA` are the same product; here it would fold `st. louis` and `stlouis` together but also
+    collapse the space in `new york`, and the canonical value has to survive a round trip to
+    `lower(lead_company.hq_city)` — which really does contain `St. Louis`, space and period
+    included. So the key keeps the shape of the name, and the *aliases* carry the variants
+    (`st louis` -> `st. louis`), seeded by scripts/bootstrap_locations.py.
+    """
+    return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+
 @dataclass
 class TechResolution:
     raw_term: str

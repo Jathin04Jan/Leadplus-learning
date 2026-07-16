@@ -25,7 +25,7 @@ import psycopg
 
 from . import config, llm, repository
 from .canonicalize import tech_key
-from .models import Chips, Term
+from .models import Chips, TermGroup
 
 log = logging.getLogger(__name__)
 
@@ -82,25 +82,52 @@ def _term_is_grounded(value: str, query: str) -> bool:
 
 
 def _reject_invented_terms(chips: Chips, query: str) -> tuple[Chips, list[str]]:
-    """Drop terms the query does not contain, and say so out loud.
+    """Drop terms and locations the query does not contain, and say so out loud.
 
     Dropped rather than kept-and-flagged: `terms` drives coverage, so an invented term makes every
     genuinely-correct company look like a partial match (2-of-3 instead of 2-of-2) and reorders
     the whole list. Dropping restores the user's actual question. The note is returned in the
     response, and the chips are editable, so nothing is hidden.
+
+    CHANGES-v2 raises the stakes on both sides, so both are checked now:
+
+      * a **negated** group is a hard filter (§2.1), so an invented negation does not merely
+        re-rank — it *deletes* companies the user never asked to exclude, and a false negative is
+        invisible by construction. Nobody can see the company that isn't there.
+      * a **location** is a hard filter too (§3.2). An invented `hq_state` empties the entire
+        result set, and an empty page reads as "no such companies exist" rather than "the parser
+        made something up".
+
+    An alternate is checked individually: `{any_of: [AWS, Azure]}` where the user said only "AWS"
+    keeps the group and drops `Azure`, because the group is still a real requirement. A group
+    whose every alternate was invented is dropped whole.
     """
-    kept: list[Term] = []
+    kept: list[TermGroup] = []
     notes: list[str] = []
-    for term in chips.terms:
-        if _term_is_grounded(term.value, query):
-            kept.append(term)
-        else:
+    for group in chips.terms:
+        alternates = [a for a in group.any_of if a.strip()]
+        grounded = [a for a in alternates if _term_is_grounded(a, query)]
+        for invented in [a for a in alternates if a not in grounded]:
             notes.append(
-                f"dropped invented term {term.value!r}: not present in the query (§9 — the parser "
+                f"dropped invented term {invented!r}: not present in the query (§9 — the parser "
                 "may tidy a name, never add one)"
             )
-            log.warning("query_parser invented a term: %r for query %r", term.value, query)
-    return chips.model_copy(update={"terms": kept}), notes
+            log.warning("query_parser invented a term: %r for query %r", invented, query)
+        if grounded:
+            kept.append(group.model_copy(update={"any_of": grounded}))
+
+    locations = []
+    for location in chips.locations:
+        if _term_is_grounded(location.value, query):
+            locations.append(location)
+        else:
+            notes.append(
+                f"dropped invented location {location.value!r}: not present in the query. A "
+                "location is a HARD filter (§3.2), so an invented one empties the result set."
+            )
+            log.warning("query_parser invented a location: %r for query %r", location.value, query)
+
+    return chips.model_copy(update={"terms": kept, "locations": locations}), notes
 
 
 async def parse_query(conn: psycopg.Connection, q: str) -> tuple[Chips, list[str]]:

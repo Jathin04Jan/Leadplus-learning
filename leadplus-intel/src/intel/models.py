@@ -76,11 +76,30 @@ class TermSource(str, Enum):
 
     This is the axis that makes "companies *using* Snowflake" a different question from
     "companies *hiring for* Snowflake" (§5.1), rather than two phrasings of one query.
+
+    `PEOPLE` is deliberately absent: CHANGES-v2 §6 is skipped (gates A and B measured **zero** on
+    this corpus), so there is no contact side for a term to be routed to.
     """
 
     USES = "USES"
     HIRING = "HIRING"
     ANY = "ANY"
+
+
+class QueryIntent(str, Enum):
+    """CHANGES-v2 §1 — what the user's sentence *is*, decided before any retrieval runs.
+
+    This exists because v1 failed silently, which is the same disease as the shipped Java system.
+    An unparseable query produced empty chips, retrieval ran anyway, and RRF confidently ranked
+    whatever the vector scan happened to return — three different questions produced the
+    *identical* garbage set. A search that cannot say "I don't understand" will lie instead.
+
+    `ACTION` and `UNPARSEABLE` never reach retrieval. See `main.triage`.
+    """
+
+    SEARCH = "SEARCH"  # proceed
+    ACTION = "ACTION"  # campaigns/emails/segments -> not this app (§11)
+    UNPARSEABLE = "UNPARSEABLE"  # no filters could be extracted
 
 
 # ---------------------------------------------------------------------------
@@ -223,17 +242,41 @@ class CompanySignalRow(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class Term(BaseModel):
-    """§6[1] — one thing the user asked for, and which side of the corpus should answer it.
+class TermGroup(BaseModel):
+    """CHANGES-v2 §2 — one requirement, possibly satisfiable several ways.
 
-    A term is NEVER a filter (rule 2). It feeds coverage (§8.4). 3-of-3 outranks 1-of-3; the
-    1-of-3 company is still returned. That is the AND/OR cliff, deleted.
+    **Alternates within a group OR. Groups AND for coverage. Fields AND.** One level of nesting,
+    and deliberately no more: a full boolean AST is a week of work plus a UI nobody can edit
+    (§2). "SAP and also AWS or Azure" is `[{any_of:[SAP]}, {any_of:[AWS, Azure]}]` — coverage 2/2.
+
+    A *positive* group is never a filter (rule 2): it feeds coverage (§8.4), so 2-of-2 outranks
+    1-of-2 and the 1-of-2 company is still returned. That is the AND/OR cliff, deleted.
+
+    A *negated* group is the deliberate exception (§2.1): **positive terms rank, negative terms
+    remove.** A positive false-positive merely ranks lower and a human can see it; a user who says
+    "exclude anything on S/4HANA" and is shown S/4HANA companies has caught the tool lying.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    value: str
+    any_of: list[str] = Field(description="Alternates. The group matches if ANY of these match.")
     source: TermSource = TermSource.ANY
+    negate: bool = False
+
+    @property
+    def label(self) -> str:
+        """How the group reads on a card and in a `Breakdown`: `AWS or Azure`."""
+        return " or ".join(v.strip() for v in self.any_of if v.strip())
+
+
+class Value(BaseModel):
+    """CHANGES-v2 §2 — a single value that may be asked for or excluded. Reused by
+    `industries` and `locations`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    value: str
+    negate: bool = False
 
 
 class Chips(BaseModel):
@@ -244,17 +287,43 @@ class Chips(BaseModel):
     identical deterministic core, with no LLM anywhere.
 
     Field-by-field, what is and is not allowed to remove a company:
-      * `terms`        — never filters (rule 2). Coverage only.
-      * `industry`     — never filters (rule 2). A soft multiplier (§8.5).
-      * `since_days`   — HARD filter. `posted_date` is a fact.
+      * `intent`          — CHANGES-v2 §1. `ACTION`/`UNPARSEABLE` remove *everything*, on purpose:
+                            they refuse rather than answer a question nobody asked.
+      * positive `terms`  — never filter (rule 2). Coverage only.
+      * negated `terms`   — HARD, company-level, and matched against canonical `technologies[]`
+                            ONLY (§2.1's non-negotiable guard rail — never prose, never `tsv`).
+      * `industries`      — soft multiplier (§8.5) by default; HARD when `industry_strict`, and
+                            always HARD when negated (§5).
+      * `locations`       — HARD. A place is a fact (§3.2).
+      * `segments` / `naics` / `sic` / `has_linkedin` — HARD. Facts on `lead_company` (§4).
+      * `since_days`      — HARD filter. `posted_date` is a fact.
       * employees/revenue — HARD filters. Firmographic facts.
       * `function` / `seniority` — filter the JOB evidence set only (see retrieve.py).
+
+    Rule 2 is *sharpened* by the new hard filters, not broken by them (§12): the rule was never
+    "don't filter", it was "don't filter on fuzzy things". A state name and a NULL check are
+    exact; `industry` stays free text and therefore stays soft unless the user says "strictly".
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    terms: list[Term] = Field(default_factory=list)
-    industry: str | None = None  # soft multiplier — NEVER a filter
+    intent: QueryIntent = QueryIntent.SEARCH
+    terms: list[TermGroup] = Field(default_factory=list)
+
+    # §5 — was `industry: str | None`. A list, because "manufacturing or automotive" is one
+    # question, and `industry_strict` because the user is allowed to override the soft default.
+    industries: list[Value] = Field(default_factory=list)
+    industry_strict: bool = False
+
+    # §3 — positives OR each other; each negative is its own AND-NOT.
+    locations: list[Value] = Field(default_factory=list)
+
+    # §4 — structured facts riding the `lead_company` join that already exists.
+    segments: list[str] = Field(default_factory=list)  # closed set: Enterprise | Mid-Market | SMB
+    naics: list[str] = Field(default_factory=list)
+    sic: list[str] = Field(default_factory=list)
+    has_linkedin: bool | None = None
+
     since_days: int | None = None  # hard filter — a fact
     function: Function | None = None
     seniority: Seniority | None = None
@@ -266,6 +335,40 @@ class Chips(BaseModel):
     max_employees: int | None = None
     min_revenue_usd: float | None = None
     max_revenue_usd: float | None = None
+
+    def positive_groups(self) -> list[TermGroup]:
+        """The groups that rank. Only these enter coverage's denominator (§2, §10)."""
+        return [g for g in self.terms if not g.negate and g.label]
+
+    def negated_groups(self) -> list[TermGroup]:
+        """The groups that remove. Never counted toward coverage — they are filters (§2)."""
+        return [g for g in self.terms if g.negate and g.label]
+
+    def is_empty(self) -> bool:
+        """CHANGES-v2 §1 — is there any predicate here at all?
+
+        `intent_mode` is excluded deliberately: it selects a weight profile (§8.2), it is not
+        something the user asked for. A `Chips` carrying nothing but `intent_mode=EITHER` is the
+        empty parse that v1 happily retrieved on.
+        """
+        return not any(
+            (
+                [g for g in self.terms if g.label],
+                self.industries,
+                self.locations,
+                self.segments,
+                self.naics,
+                self.sic,
+                self.has_linkedin is not None,
+                self.since_days is not None,
+                self.function is not None,
+                self.seniority is not None,
+                self.min_employees is not None,
+                self.max_employees is not None,
+                self.min_revenue_usd is not None,
+                self.max_revenue_usd is not None,
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -303,8 +406,23 @@ class Breakdown(BaseModel):
     weighted_subtotal: float
     industry_multiplier: float
     intent_mode: IntentMode
-    matched_terms: list[str] = Field(default_factory=list)
-    unmatched_terms: list[str] = Field(default_factory=list)
+
+    # §10 — groups, not flat terms: `AWS or Azure` is ONE requirement, and reporting it as two
+    # would say a company matching only AWS covered half of it. It covered all of it.
+    matched_groups: list[str] = Field(default_factory=list)
+    unmatched_groups: list[str] = Field(default_factory=list)
+
+    # §10 — which negated group removed this company. Non-empty **only** on the companies in
+    # `SearchResponse.excluded`, which carry the score they *would* have had.
+    # **An exclusion the user cannot see is one they cannot trust.**
+    excluded_by: list[str] = Field(default_factory=list)
+
+    # The rank this company would have held in the FULL unfiltered ranking — i.e. the position it
+    # occupied before the negation removed it. Measured by ranking the whole un-negated candidate
+    # set, not by counting positions within `excluded`: those two numbers differ, and only the
+    # first one is the claim a user would read it as.
+    would_rank: int | None = None
+
     matched_count: int
     asked_count: int
     distinct_roles: int
@@ -326,6 +444,15 @@ class CompanyResult(BaseModel):
     breakdown: Breakdown
     evidence: list[Evidence] = Field(default_factory=list)
 
+    # CHANGES-v2 §3/§4 — the facts the new hard filters select on, echoed back on every card.
+    # A filter the user cannot verify from the result is a filter they have to take on faith, and
+    # "every result really is in California" should be readable rather than believed.
+    hq_city: str | None = None
+    hq_state: str | None = None
+    hq_country: str | None = None
+    segments: list[str] = Field(default_factory=list)
+    linkedin_url: str | None = None
+
 
 class SearchResponse(BaseModel):
     chips: Chips
@@ -334,3 +461,13 @@ class SearchResponse(BaseModel):
     timing_ms: dict[str, float]
     query_paraphrase: str
     notes: list[str] = Field(default_factory=list)
+
+    # CHANGES-v2 §10 — the companies a negated group removed, each carrying the score and
+    # `breakdown.excluded_by` explaining what it would have scored and which group deleted it.
+    # Ordered by the rank they would have held. Empty when the query negates nothing.
+    excluded: list[CompanyResult] = Field(default_factory=list)
+
+    # CHANGES-v2 §1 — set when `intent` is ACTION or UNPARSEABLE. When this is non-null,
+    # `companies` is empty **because we refused**, not because nothing matched. The UI must render
+    # the difference; an empty list is exactly the silent failure this field exists to end.
+    refusal: str | None = None

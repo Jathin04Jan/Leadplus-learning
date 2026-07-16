@@ -109,6 +109,51 @@
   .chip .x:hover { color: var(--bad); background: #2a1c1a; }
   .chip.empty { color: var(--ink-faint); border-style: dashed; padding: 4px 12px; font-size: 13px; }
 
+  /* CHANGES-v2: a chip that DELETES rows must not look like a chip that ranks them. */
+  .chip.negated { border-color: #5c2b2b; background: #241618; }
+  .chip.negated .chip-label { text-decoration: line-through; color: #d98a7c; }
+  .chip.loc { border-color: #2b4a5c; background: #16202a; }
+  .chip.ind { border-color: #3a3320; background: #221d10; }
+  .chip-kind {
+    font-size: 9.5px; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--ink-faint); border: 1px solid var(--line); border-radius: 4px; padding: 1px 4px;
+  }
+  .field input.tiny { width: 62px; }
+  b.hard, .hard { color: var(--warn); }
+
+  /* §1 — the refusal states. Loud on purpose: the failure mode being fixed is a wrong answer
+     that looks exactly like a right one. */
+  .refusal {
+    border-radius: var(--radius); padding: 18px 20px; margin-bottom: 20px;
+    border: 1px solid var(--line); background: var(--panel);
+  }
+  .refusal.action { border-color: #2b4a5c; background: #16202a; }
+  .refusal.unparseable { border-color: #3a3320; background: #221d10; }
+  .refusal-tag {
+    display: inline-block; font-size: 10px; text-transform: uppercase; letter-spacing: .1em;
+    font-weight: 700; padding: 2px 8px; border-radius: 4px; margin-bottom: 10px;
+    background: #131820; color: var(--warn); border: 1px solid var(--line);
+  }
+  .refusal.action .refusal-tag { color: var(--accent); }
+  .refusal-msg { margin: 0 0 8px; font-size: 16px; color: var(--ink); }
+  .refusal-why { margin: 0; font-size: 12.5px; color: var(--ink-faint); line-height: 1.6; }
+
+  /* §10 — the exclusions, visible. */
+  .excluded-panel {
+    background: var(--panel); border: 1px solid #5c2b2b; border-radius: var(--radius);
+    padding: 12px 16px; margin-bottom: 16px;
+  }
+  .excluded-panel summary {
+    cursor: pointer; font-size: 13px; color: #d98a7c; user-select: none;
+    list-style: none; display: inline-block;
+  }
+  .excluded-panel summary::-webkit-details-marker { display: none; }
+  .excluded-panel summary::before { content: "▸ "; }
+  .excluded-panel[open] summary::before { content: "▾ "; }
+  .excluded-panel .hint { margin: 10px 0 12px; font-size: 12px; color: var(--ink-faint); }
+  .excluded-row { border-left-color: #5c2b2b; }
+  .tag.neg { background: #241618; border-color: #5c2b2b; color: #d98a7c; font-weight: 600; }
+
   .fields { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-end; }
   .field { display: flex; flex-direction: column; gap: 5px; }
   .field label {
@@ -226,8 +271,11 @@
   <p class="examples">
     Try:
     <button onclick="demo('SAP manufacturing companies using Snowflake and AWS')">SAP manufacturers using Snowflake and AWS</button>·
-    <button onclick="demo('manufacturers hiring for dbt and Kafka last quarter')">manufacturers hiring for dbt and Kafka last quarter</button>·
-    <button onclick="demo('SAP shops hiring dbt engineers')">SAP shops hiring dbt engineers</button>
+    <button onclick="demo('companies using Snowflake and AWS, exclude anything already on S/4HANA')">…excluding S/4HANA</button>·
+    <button onclick="demo('SAP and also AWS or Azure')">SAP and also AWS or Azure</button>·
+    <button onclick="demo('mid-market companies in Illinois or Ohio')">mid-market in Illinois or Ohio</button>·
+    <button onclick="demo('SAP shops hiring dbt engineers')">SAP shops hiring dbt engineers</button>·
+    <button onclick="demo('create a 3-step campaign for these companies')">create a 3-step campaign</button>
   </p>
 
   <div id="results">
@@ -238,7 +286,11 @@
     The query is parsed by an LLM into chips, and <b>nothing after that is an LLM</b>: retrieval is
     lexical <code>ts_rank</code> + exact cosine, fused with reciprocal rank fusion, then scored by a
     fixed formula. Identical chips always return an identical ranking.<br>
-    Terms never filter — they score. A company matching 1 of 3 terms is ranked lower, never dropped.
+    Positive terms never filter — they score. A company matching 1 of 3 groups is ranked lower,
+    never dropped. <b class="hard">Hard</b> chips (locations, segments, NAICS/SIC, LinkedIn, sizes
+    and <b>exclusions</b>) do remove companies — that is what makes them facts rather than
+    guesses, and every exclusion is listed back to you with what it deleted.<br>
+    A question this app cannot answer gets <b>refused</b>, not answered badly.
   </footer>
 
 </div>
@@ -260,31 +312,53 @@
     rerun();
   }
 
-  function addTerm() {
-    const input = document.getElementById('new-term');
-    const value = input.value.trim();
-    if (!value) return;
+  // Build one chip. `kind` picks which Chips field it lands in; the server rebuilds the object
+  // from these names in chips_from_form(). Every negate control is a <select>, never a checkbox:
+  // an unchecked checkbox submits nothing, which would misalign the parallel getlist()s and pair
+  // the wrong negation with the wrong chip — silently.
+  function makeChip(kind, value) {
+    const spec = {
+      group:    {cls: 'chip',          field: 'group_any_of',    neg: 'group_negate',    opts: ['+', '−']},
+      location: {cls: 'chip loc',      field: 'location_value',  neg: 'location_negate', opts: ['in', 'not in']},
+      industry: {cls: 'chip ind',      field: 'industry_value',  neg: 'industry_negate', opts: ['in', 'not in']},
+    }[kind];
 
     const chip = document.createElement('span');
-    chip.className = 'chip';
+    chip.className = spec.cls;
 
     const hidden = document.createElement('input');
     hidden.type = 'hidden';
-    hidden.name = 'term_value';
+    hidden.name = spec.field;
     hidden.value = value;
+
+    const negate = document.createElement('select');
+    negate.name = spec.neg;
+    negate.setAttribute('onchange', 'rerun()');
+    ['false', 'true'].forEach((v, i) => {
+      const opt = document.createElement('option');
+      opt.value = v;
+      opt.textContent = spec.opts[i];
+      negate.appendChild(opt);
+    });
 
     const label = document.createElement('span');
     label.className = 'chip-label';
-    label.textContent = value;
+    // "Kafka or Pulsar" — one requirement, two acceptable answers (§2).
+    label.textContent = value.split(',').map(s => s.trim()).filter(Boolean).join(' or ');
 
-    const select = document.createElement('select');
-    select.name = 'term_source';
-    select.setAttribute('onchange', 'rerun()');
-    for (const s of ['ANY', 'USES', 'HIRING']) {
-      const opt = document.createElement('option');
-      opt.value = s;
-      opt.textContent = s === 'USES' ? 'uses' : (s === 'HIRING' ? 'hiring for' : 'either');
-      select.appendChild(opt);
+    chip.append(hidden, negate, label);
+
+    if (kind === 'group') {
+      const select = document.createElement('select');
+      select.name = 'group_source';
+      select.setAttribute('onchange', 'rerun()');
+      for (const s of ['ANY', 'USES', 'HIRING']) {
+        const opt = document.createElement('option');
+        opt.value = s;
+        opt.textContent = s === 'USES' ? 'uses' : (s === 'HIRING' ? 'hiring for' : 'either');
+        select.appendChild(opt);
+      }
+      chip.append(select);
     }
 
     const x = document.createElement('button');
@@ -292,9 +366,16 @@
     x.className = 'x';
     x.textContent = '×';
     x.setAttribute('onclick', 'removeChip(this)');
+    chip.append(x);
+    return chip;
+  }
 
-    chip.append(hidden, label, select, x);
-    document.getElementById('chip-list').appendChild(chip);
+  function addChip() {
+    const input = document.getElementById('new-term');
+    const value = input.value.trim();
+    if (!value) return;
+    const kind = document.getElementById('new-kind').value;
+    document.getElementById('chip-list').appendChild(makeChip(kind, value));
     input.value = '';
     rerun();
   }

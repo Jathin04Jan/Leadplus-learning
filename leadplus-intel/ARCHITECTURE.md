@@ -87,6 +87,11 @@ the result without reading a job ad.
   question. A real tenant would see a gated subset — say so in the UI.
 - **Never writes to LeadPlus tables.** `lead_company*` belongs to the Java `search` module. We read
   them and write only our own derived tables.
+- **Not a people search. `lead_contact` stays excluded** — see §3's note. CHANGES-v2 §6 proposed a
+  `contact_signal` index and it was **skipped on measurement, not on principle**: the two gates
+  that would have made it useful are zero on this corpus (§0). Nothing in this app answers a
+  question about a named person, and the `PEOPLE` term source, `ContactFunction`,
+  `ContactSeniority` and `result_mode` are deliberately unbuilt.
 
 ---
 
@@ -99,7 +104,35 @@ Source: local Postgres (`leadplus_local`, :5433). **Never query RDS from the app
 | `lead_company_job` | job postings — the signal |
 | `lead_company` | firmographics + Apollo technographics |
 | `lead_query` | existing controlled vocabulary (industries etc.) |
-| ~~`lead_contact`~~ | **excluded** — PII, and unnecessary here |
+| ~~`lead_contact`~~ | **excluded** — PII, and unnecessary here. Still true; see below. |
+
+### `lead_contact` stays excluded — the decision, and the measurement behind it
+
+CHANGES-v2 §6 proposed indexing a **role census** (`title`, `department`, `seniority`, normalized
+title tokens — never names, emails, phones or LinkedIn) so the app could answer *"manufacturers
+whose CFO arrived from a Big-4 firm"*. **It was skipped**, and §6 of that spec is marked SKIPPED
+rather than deferred. Two gates were run against this corpus first:
+
+| Gate | Question | Result |
+|---|---|---|
+| **A** | Does `apollo_contact_data` carry `employment_history`? | **0 / 518** |
+| **B** | Are there CFO / VP-Finance contacts to return? | **0 / 1,242** |
+
+Both are zero. "Big-4 alumnus recently landed" is **dead on the data** — the field it needs does
+not exist — and a `PEOPLE` result mode has nothing to return, so it could be neither built
+usefully nor tested honestly. Building it anyway would have meant shipping a feature whose only
+evidence of working was that it compiled.
+
+So the position is unchanged and deliberate: **this app indexes companies and job postings.** A
+query about contacts is `UNPARSEABLE` (§1) rather than quietly answered with the company half of
+the question.
+
+**If the real corpus ever lands**, the original design holds and is worth revisiting: reuse
+`lead_contact_normalized_title` (it already carries `canonical_title`/`seniority`/`keywords` —
+that gate passed), ingest the role census and no identifying fields, and note honestly that "the
+CFO of Acme" is *pseudonymous*, not anonymous — a role is a person when the company is small
+enough. Do **not** widen the job `Function` enum with `FINANCE`: job enums describe requisitions,
+not people, and merging the two vocabularies is how a schema starts lying about what it holds.
 
 ### `lead_company_job` (relevant columns)
 

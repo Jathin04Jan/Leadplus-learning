@@ -68,6 +68,21 @@ CREATE TABLE IF NOT EXISTS tech_canonical (
   aliases   text[]
 );
 
+-- CHANGES-v2 §3.1 — the location vocabulary (rule 5, applied to place names).
+--
+-- `canonical` is the FULL LOWERCASE NAME (`california`, `united states`, `st. louis`), because
+-- that is the form `lead_company.hq_state`/`hq_city`/`hq_country` actually hold in this restore
+-- (CHANGES-v2 §0 measured it: full names, not `CA`). The abbreviations are the *aliases*
+-- pointing at it. The original spec had this inverted and would have matched nothing.
+--
+-- Ours, derived and rebuildable: `scripts/bootstrap_locations.py` recreates it, no LLM.
+CREATE TABLE IF NOT EXISTS location_alias (
+  alias      text PRIMARY KEY,   -- 'ca', 'calif', 'california'  (lowercased, whitespace-collapsed)
+  canonical  text NOT NULL,      -- 'california'  <- matches lower(lead_company.hq_state)
+  kind       text NOT NULL       -- 'state' | 'country' | 'city'
+);
+CREATE INDEX IF NOT EXISTS location_alias_canonical_idx ON location_alias (canonical);
+
 -- §5.2 stage 3 — terms we could not resolve. A human resolves these; we NEVER auto-guess.
 CREATE TABLE IF NOT EXISTS tech_review_queue (
   raw_term    text PRIMARY KEY,

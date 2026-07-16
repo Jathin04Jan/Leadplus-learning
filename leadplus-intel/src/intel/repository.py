@@ -71,6 +71,7 @@ def health(conn: psycopg.Connection) -> dict[str, Any]:
         "company_signal",
         "tech_canonical",
         "tech_review_queue",
+        "location_alias",
         "ingest_dead_letter",
     ):
         exists = conn.execute("SELECT to_regclass(%s) AS reg", (table,)).fetchone()
@@ -755,6 +756,83 @@ def update_company_signal_technologies(
 
 
 # ---------------------------------------------------------------------------
+# CHANGES-v2 §3.1 — the location vocabulary
+# ---------------------------------------------------------------------------
+
+
+def replace_location_aliases(
+    conn: psycopg.Connection, rows: Sequence[tuple[str, str, str]]
+) -> int:
+    """Rebuild `location_alias` wholesale from the seed. A pure function of the seed lists."""
+    if not rows:
+        return 0
+    with conn.transaction():
+        conn.execute("TRUNCATE location_alias")
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO location_alias (alias, canonical, kind) VALUES (%s, %s, %s) "
+                "ON CONFLICT (alias) DO UPDATE SET canonical = EXCLUDED.canonical, kind = EXCLUDED.kind",
+                list(rows),
+            )
+    return len(rows)
+
+
+def count_location_aliases(conn: psycopg.Connection) -> dict[str, Any]:
+    return conn.execute(
+        """
+        SELECT count(*) AS aliases, count(DISTINCT canonical) AS canonicals,
+               count(*) FILTER (WHERE kind = 'state')   AS states,
+               count(*) FILTER (WHERE kind = 'country') AS countries,
+               count(*) FILTER (WHERE kind = 'city')    AS cities
+        FROM location_alias
+        """
+    ).fetchone()  # type: ignore[return-value]
+
+
+def distinct_hq_locations(conn: psycopg.Connection) -> dict[str, list[str]]:
+    """The place names this restore actually holds — READ-ONLY, and the reason §3.1 was inverted.
+
+    The seed is a static list, but a static list that misses a value present in `hq_city` fails
+    silently and invisibly (the query just returns nothing). So the bootstrap reads the corpus's
+    own distinct values and guarantees every one of them is resolvable to itself. This is a read
+    of `lead_company`; §2's "never writes to LeadPlus tables" is untouched.
+    """
+    out: dict[str, list[str]] = {}
+    for column, kind in (("hq_state", "state"), ("hq_city", "city"), ("hq_country", "country")):
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT trim({column}) AS value
+            FROM lead_company
+            WHERE active AND {column} IS NOT NULL AND trim({column}) <> ''
+            ORDER BY 1
+            """
+        ).fetchall()
+        out[kind] = [r["value"] for r in rows]
+    return out
+
+
+def expand_locations(conn: psycopg.Connection, aliases: Sequence[str]) -> list[dict[str, Any]]:
+    """alias key -> canonical location. The §3.1 expansion, done in the repository.
+
+    The parser emits raw text ("CA", "Calif", "California"); `hq_state` holds `California`. This
+    is the only place that gap is closed, which is why §3 says the repository expands rather than
+    the parser guessing: the parser cannot know what spelling this restore uses, and if it guesses
+    `CA` the filter matches zero rows and the user is told, wrongly, that there are no Californian
+    manufacturers.
+    """
+    if not aliases:
+        return []
+    return conn.execute(
+        """
+        SELECT alias, canonical, kind FROM location_alias
+        WHERE alias = ANY(%(aliases)s::text[])
+        ORDER BY alias
+        """,
+        {"aliases": list(aliases)},
+    ).fetchall()
+
+
+# ---------------------------------------------------------------------------
 # §5.5 — industry canonicalisation
 # ---------------------------------------------------------------------------
 
@@ -919,6 +997,59 @@ _FIRMO_FILTERS = """
           AND (%(max_revenue_usd)s::numeric IS NULL OR c.revenue_usd <= %(max_revenue_usd)s::numeric)
 """
 
+# CHANGES-v2 §2.1/§3.2/§4/§5 — the company-level fact filters.
+#
+# Shared verbatim by all four §6[3] lists. Every one of them joins `lead_company` as `c` on the
+# company id (`c.id = j.company_id` / `c.id = cs.company_id`), so `c.id` is the canonical company
+# id in every query here and one fragment serves them all.
+#
+# Rule 2 is not broken by any of this, it is sharpened (§12): a state, a segment, a NAICS code and
+# a NULL check are **facts**, and rule 2 says filter on facts. `industry` remains free text and
+# therefore remains a soft multiplier — unless the user explicitly said "strictly", which is what
+# `industry_pos` carries.
+#
+# ---- THE NEGATION GUARD RAIL (§2.1) — NON-NEGOTIABLE, DO NOT "IMPROVE" THIS ----
+#
+# Negation matches the canonical `technologies[]` array with `&&` (array overlap = exact element
+# equality) and **NEVER** `paraphrase`, `tsv`, or any `LIKE`. A `NOT LIKE '%sap%'` here would
+# delete **Sapient Consulting Group** by substring — this project's founding bug, inverted. And
+# inverted is strictly worse: a false *positive* ranks lower and a human can see it and laugh; a
+# false *negative* is a company that silently never appears, which nobody can see at all.
+#
+# The empty-array cases need no `cardinality` guard: `technologies && '{}'::text[]` is always
+# false, so `NOT EXISTS(...)` is trivially true when nothing is negated.
+_FACT_FILTERS = """
+          AND (cardinality(%(loc_pos)s::text[]) = 0
+               OR lower(coalesce(c.hq_state, ''))   = ANY(%(loc_pos)s::text[])
+               OR lower(coalesce(c.hq_city, ''))    = ANY(%(loc_pos)s::text[])
+               OR lower(coalesce(c.hq_country, '')) = ANY(%(loc_pos)s::text[]))
+          AND NOT (lower(coalesce(c.hq_state, ''))   = ANY(%(loc_neg)s::text[])
+                OR lower(coalesce(c.hq_city, ''))    = ANY(%(loc_neg)s::text[])
+                OR lower(coalesce(c.hq_country, '')) = ANY(%(loc_neg)s::text[]))
+          AND (cardinality(%(segments)s::text[]) = 0
+               OR coalesce(c.segments::text[], '{}'::text[]) && %(segments)s::text[])
+          AND (cardinality(%(naics)s::text[]) = 0
+               OR coalesce(c.naics_codes::text[], '{}'::text[]) && %(naics)s::text[])
+          AND (cardinality(%(sic)s::text[]) = 0
+               OR coalesce(c.sic_codes::text[], '{}'::text[]) && %(sic)s::text[])
+          AND (%(has_linkedin)s::boolean IS NULL
+               OR (%(has_linkedin)s::boolean IS TRUE  AND c.linkedin_url IS NOT NULL)
+               OR (%(has_linkedin)s::boolean IS FALSE AND c.linkedin_url IS NULL))
+          AND (cardinality(%(industry_pos)s::text[]) = 0
+               OR EXISTS (SELECT 1 FROM company_signal ics
+                          WHERE ics.company_id = c.id
+                            AND lower(ics.industry_canonical) = ANY(%(industry_pos)s::text[])))
+          AND NOT EXISTS (SELECT 1 FROM company_signal ics
+                          WHERE ics.company_id = c.id
+                            AND lower(ics.industry_canonical) = ANY(%(industry_neg)s::text[]))
+          AND NOT EXISTS (SELECT 1 FROM company_signal ncs
+                          WHERE ncs.company_id = c.id
+                            AND ncs.technologies && %(neg_uses)s::text[])
+          AND NOT EXISTS (SELECT 1 FROM job_signal njs
+                          WHERE njs.company_id = c.id
+                            AND njs.technologies && %(neg_hiring)s::text[])
+"""
+
 # §6[3a]'s tsquery, built from the chip phrases.
 #
 # The phrases are OR'd, never AND'd. An AND here would re-create defect #1 from the other side:
@@ -958,6 +1089,7 @@ def search_jobs_lexical(
           AND j.tsv @@ q.query
           {_JOB_FILTERS}
           {_FIRMO_FILTERS}
+          {_FACT_FILTERS}
         ORDER BY score DESC, j.job_id
         LIMIT %(limit)s
         """,
@@ -977,6 +1109,7 @@ def search_jobs_semantic(
         WHERE j.embedding IS NOT NULL
           {_JOB_FILTERS}
           {_FIRMO_FILTERS}
+          {_FACT_FILTERS}
         ORDER BY j.embedding <=> %(qvec)s::vector, j.job_id
         LIMIT %(limit)s
         """,
@@ -998,6 +1131,7 @@ def search_companies_lexical(
         WHERE q.query IS NOT NULL
           AND cs.tsv @@ q.query
           {_FIRMO_FILTERS}
+          {_FACT_FILTERS}
         ORDER BY score DESC, cs.company_id
         LIMIT %(limit)s
         """,
@@ -1016,6 +1150,7 @@ def search_companies_semantic(
         JOIN lead_company c ON c.id = cs.company_id
         WHERE cs.embedding IS NOT NULL
           {_FIRMO_FILTERS}
+          {_FACT_FILTERS}
         ORDER BY cs.embedding <=> %(qvec)s::vector, cs.company_id
         LIMIT %(limit)s
         """,
@@ -1027,7 +1162,7 @@ def fetch_company_details(
     conn: psycopg.Connection,
     *,
     company_ids: Sequence[int],
-    industry_vec: Sequence[float] | None = None,
+    industry_vecs: Sequence[Sequence[float]] = (),
 ) -> list[dict[str, Any]]:
     """The candidates' scoring inputs, plus §8.5's cosine.
 
@@ -1036,6 +1171,13 @@ def fetch_company_details(
     written at ingest, so this is exactly §8.5's
     `cosine(emb(company.industry_raw), emb(asked_industry))`. It is NULL when no industry was
     asked for — in which case §8.5 returns 1.0 and never looks.
+
+    CHANGES-v2 §10 takes `max()` across the asked industries, so this takes a *list* of vectors
+    and returns the best cosine among them. "manufacturing or automotive companies" must not
+    penalise a manufacturer for being a poor automotive match — the user asked for either.
+
+    The vectors cross the wire as a `text[]` of pgvector literals and are cast per element, which
+    keeps the statement static and single-parameter for any number of asked industries.
     """
     if not company_ids:
         return []
@@ -1044,20 +1186,56 @@ def fetch_company_details(
         SELECT cs.company_id,
                c.name,
                c.domain,
+               c.hq_city,
+               c.hq_state,
+               c.hq_country,
+               c.segments,
+               c.linkedin_url,
                cs.paraphrase,
                cs.technologies,
                cs.industry_raw,
                cs.industry_canonical,
                CASE
-                 WHEN %(ivec)s::vector IS NULL OR cs.industry_embedding IS NULL THEN NULL
-                 ELSE 1 - (cs.industry_embedding <=> %(ivec)s::vector)
+                 WHEN cardinality(%(ivecs)s::text[]) = 0 OR cs.industry_embedding IS NULL THEN NULL
+                 ELSE (SELECT max(1 - (cs.industry_embedding <=> v::vector))
+                       FROM unnest(%(ivecs)s::text[]) AS v)
                END AS industry_similarity
         FROM company_signal cs
         JOIN lead_company c ON c.id = cs.company_id
         WHERE cs.company_id = ANY(%(ids)s::bigint[])
         ORDER BY cs.company_id
         """,
-        {"ids": list(company_ids), "ivec": _vec(industry_vec)},
+        {"ids": list(company_ids), "ivecs": [_vec(v) for v in industry_vecs]},
+    ).fetchall()
+
+
+def fetch_company_technology_sets(
+    conn: psycopg.Connection, *, company_ids: Sequence[int]
+) -> list[dict[str, Any]]:
+    """Each company's canonical technologies, split by the side of the corpus that asserts them.
+
+    Exists to attribute an exclusion (§10's `excluded_by`): `_FACT_FILTERS` removes a company in
+    SQL, but "removed" with no reason attached is exactly the opaque behaviour §2.1 is fighting.
+    This returns the same two arrays the `&&` tested, so Python can name the group that fired.
+
+    `uses_technologies` is the company profile's; `hiring_technologies` is the union across its
+    postings — mirroring the two `NOT EXISTS` clauses exactly, so the report cannot disagree with
+    the filter.
+    """
+    if not company_ids:
+        return []
+    return conn.execute(
+        """
+        SELECT cs.company_id,
+               coalesce(cs.technologies, '{}') AS uses_technologies,
+               coalesce((SELECT array_agg(DISTINCT t)
+                         FROM job_signal js, unnest(js.technologies) AS t
+                         WHERE js.company_id = cs.company_id), '{}') AS hiring_technologies
+        FROM company_signal cs
+        WHERE cs.company_id = ANY(%(ids)s::bigint[])
+        ORDER BY cs.company_id
+        """,
+        {"ids": list(company_ids)},
     ).fetchall()
 
 
