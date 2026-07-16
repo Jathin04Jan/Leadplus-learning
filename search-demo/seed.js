@@ -100,6 +100,9 @@ function makeCompany(i, golden) {
     scraped_services: chance(0.35) ? pickSome(SCRAPED_SERVICES, 1 + Math.floor(rnd() * 2)) : [],
     segments: chance(0.5) ? ['Enterprise'] : ['Mid-Market'],
     active: true,
+    // NOT NULL in the real table with no default, so the seed must supply them
+    is_target_account: chance(0.2),
+    score: Math.floor(rnd() * 100),
   };
 }
 
@@ -119,9 +122,13 @@ rows.push({
 const { Client } = pg;
 const client = new Client({ connectionString: config.databaseUrl });
 
+// The table has all 45 real columns; the seed populates the ones a freshly-sourced pool
+// would actually have. The rest (salesperson_*, zoho_account_id, icp_tag, ...) stay NULL,
+// which is also what they look like in the real pool before enrichment/CRM sync.
 const COLS = ['name','domain','website_url','industry','hq_city','hq_state','hq_country',
   'employee_range','employee_count','revenue_usd','keywords','technologies',
-  'scraped_technologies','scraped_tools','scraped_services','segments','active'];
+  'scraped_technologies','scraped_tools','scraped_services','segments','active',
+  'is_target_account','score'];
 
 const run = async () => {
   await client.connect();
