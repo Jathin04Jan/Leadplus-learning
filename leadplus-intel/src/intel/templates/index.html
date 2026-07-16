@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LeadPlus Intent Search</title>
+<!-- htmx is vendored, not CDN-loaded: the app must run with no external origin and no CORS. -->
+<script src="/static/htmx.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1216;
+    --panel: #171b21;
+    --panel-2: #1d232b;
+    --line: #2a323d;
+    --ink: #e8ecf1;
+    --ink-dim: #98a4b3;
+    --ink-faint: #6b7787;
+    --accent: #4c9aff;
+    --accent-dim: #2d5f9e;
+    --good: #35c68a;
+    --warn: #e8b339;
+    --bad: #e8674f;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent); }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 32px 24px 80px; }
+
+  header h1 { margin: 0 0 4px; font-size: 22px; letter-spacing: -0.01em; }
+  header .sub { color: var(--ink-dim); font-size: 13.5px; margin: 0; }
+
+  /* §2: the lab is not production and must say so. */
+  .lab {
+    margin: 18px 0 24px;
+    padding: 12px 14px;
+    border: 1px solid #3a3320;
+    background: #221d10;
+    border-radius: var(--radius);
+    color: #e5cf9a;
+    font-size: 12.5px;
+    line-height: 1.5;
+  }
+  .lab b { color: #f5e3b4; }
+
+  form.search { display: flex; gap: 10px; margin-bottom: 10px; }
+  input[type=text], input[type=number], select {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font: inherit;
+    outline: none;
+  }
+  input[type=text]:focus, select:focus { border-color: var(--accent-dim); }
+  form.search input[type=text] { flex: 1; font-size: 15.5px; }
+  button {
+    background: var(--accent); color: #06101f; border: 0; border-radius: 8px;
+    padding: 10px 18px; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button:hover { filter: brightness(1.08); }
+  button.ghost {
+    background: transparent; color: var(--ink-dim); border: 1px solid var(--line);
+    font-weight: 500;
+  }
+  button.ghost:hover { color: var(--ink); border-color: var(--ink-faint); }
+
+  .examples { color: var(--ink-faint); font-size: 12.5px; margin-bottom: 26px; }
+  .examples button {
+    background: none; border: 0; color: var(--accent); padding: 0 4px;
+    font: inherit; font-size: 12.5px; cursor: pointer; text-decoration: underline dotted;
+  }
+
+  .htmx-indicator { opacity: 0; transition: opacity .15s; color: var(--ink-dim); font-size: 13px; }
+  .htmx-request .htmx-indicator, .htmx-request.htmx-indicator { opacity: 1; }
+
+  /* ---- chips ---------------------------------------------------------- */
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 16px; margin-bottom: 20px;
+  }
+  .panel h2 {
+    margin: 0 0 4px; font-size: 12px; text-transform: uppercase;
+    letter-spacing: .09em; color: var(--ink-faint); font-weight: 600;
+  }
+  .panel .hint { margin: 0 0 14px; font-size: 12.5px; color: var(--ink-faint); }
+  .chip-list { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 999px; padding: 4px 6px 4px 12px;
+  }
+  .chip-label { font-weight: 600; font-size: 13.5px; }
+  .chip select {
+    padding: 2px 4px; font-size: 11px; border-radius: 6px;
+    background: #131820; border-color: var(--line); color: var(--ink-dim);
+  }
+  .chip .x {
+    background: none; border: 0; color: var(--ink-faint); cursor: pointer;
+    font-size: 15px; line-height: 1; padding: 2px 6px; border-radius: 50%;
+  }
+  .chip .x:hover { color: var(--bad); background: #2a1c1a; }
+  .chip.empty { color: var(--ink-faint); border-style: dashed; padding: 4px 12px; font-size: 13px; }
+
+  .fields { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-end; }
+  .field { display: flex; flex-direction: column; gap: 5px; }
+  .field label {
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em;
+    color: var(--ink-faint); font-weight: 600;
+  }
+  .field input, .field select { padding: 7px 9px; font-size: 13px; }
+  .field input { width: 130px; }
+  .add-term { display: flex; gap: 6px; }
+  .add-term input { width: 150px; }
+
+  .paraphrase {
+    margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line);
+    font-size: 12.5px; color: var(--ink-faint);
+  }
+  .paraphrase code { color: var(--ink-dim); font-size: 12px; }
+
+  /* ---- results -------------------------------------------------------- */
+  .meta {
+    display: flex; justify-content: space-between; align-items: baseline;
+    margin-bottom: 12px; font-size: 12.5px; color: var(--ink-faint);
+  }
+  .meta .timing code { color: var(--ink-dim); }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 16px 18px; margin-bottom: 12px;
+  }
+  .card-head { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; }
+  .card-head h3 { margin: 0; font-size: 16.5px; letter-spacing: -0.01em; }
+  .card-head .rank { color: var(--ink-faint); font-weight: 400; font-size: 13px; margin-right: 8px; }
+  .card-sub { color: var(--ink-faint); font-size: 12.5px; margin: 3px 0 0; }
+  .score { text-align: right; flex-shrink: 0; }
+  .score .n { font-size: 22px; font-weight: 700; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+  .score .l { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--ink-faint); }
+
+  .company-para { margin: 12px 0 0; font-size: 14px; color: var(--ink-dim); }
+
+  .terms { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+  .tag {
+    font-size: 11.5px; padding: 2px 9px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--ink-faint);
+  }
+  .tag.hit { background: #10281f; border-color: #1d5f43; color: var(--good); }
+  .tag.miss { background: #241618; border-color: #5c2b2b; color: #d98a7c; text-decoration: line-through; }
+
+  details.why { margin-top: 12px; }
+  details.why summary {
+    cursor: pointer; font-size: 12px; color: var(--ink-faint);
+    list-style: none; user-select: none; display: inline-block;
+  }
+  details.why summary::-webkit-details-marker { display: none; }
+  details.why summary:hover { color: var(--ink-dim); }
+  details.why summary::before { content: "▸ "; }
+  details.why[open] summary::before { content: "▾ "; }
+
+  table.axes { border-collapse: collapse; margin-top: 10px; font-size: 12.5px; width: 100%; max-width: 560px; }
+  table.axes td { padding: 3px 0; color: var(--ink-dim); }
+  table.axes td.name { color: var(--ink-faint); width: 88px; }
+  table.axes td.num { font-variant-numeric: tabular-nums; text-align: right; width: 56px; }
+  table.axes td.bar { width: 130px; padding-left: 12px; }
+  table.axes td.note { color: var(--ink-faint); padding-left: 12px; font-size: 11.5px; }
+  table.axes tr.sum td { border-top: 1px solid var(--line); padding-top: 6px; color: var(--ink); }
+  table.axes tr.dead td { color: var(--ink-faint); opacity: .55; }
+  .bar { background: #131820; border-radius: 3px; height: 6px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: var(--accent-dim); }
+  .bar > i.on { background: var(--accent); }
+
+  .evidence { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px; }
+  .evidence h4 {
+    margin: 0 0 8px; font-size: 10.5px; text-transform: uppercase;
+    letter-spacing: .08em; color: var(--ink-faint); font-weight: 600;
+  }
+  .job { padding: 8px 0 8px 12px; border-left: 2px solid var(--line); margin-bottom: 8px; }
+  .job:last-child { margin-bottom: 0; }
+  .job-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+  .job-title { font-weight: 600; font-size: 13.5px; }
+  .job-date { color: var(--ink-faint); font-size: 11.5px; }
+  .job-para { margin: 4px 0 0; color: var(--ink-dim); font-size: 13px; }
+  .job-para::before { content: "→ "; color: var(--ink-faint); }
+
+  .note {
+    background: #221d10; border: 1px solid #3a3320; color: #e5cf9a;
+    border-radius: 8px; padding: 9px 12px; font-size: 12.5px; margin-bottom: 12px;
+  }
+  .empty-state { color: var(--ink-faint); text-align: center; padding: 40px; font-size: 14px; }
+  footer { margin-top: 40px; color: var(--ink-faint); font-size: 12px; line-height: 1.7; }
+  footer code { color: var(--ink-dim); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>LeadPlus Intent Search</h1>
+    <p class="sub">Job postings are buying signals. Search them, get ranked companies with the evidence.</p>
+  </header>
+
+  <div class="lab">
+    <b>Lab environment — not production.</b>
+    The corpus is a <b>synthetic replica</b> (386 job postings across 301 companies), so results
+    demonstrate that the architecture works; they say nothing about real-world relevance.
+    There is <b>no auth, no multi-tenancy and no data-pack gating</b> — every company in the pool is
+    visible to you. A real tenant would see a gated subset.
+  </div>
+
+  <form class="search" hx-post="/ui/search" hx-target="#results" hx-swap="innerHTML"
+        hx-indicator="#spin">
+    <input type="text" name="q" id="q" autocomplete="off" autofocus
+           placeholder="e.g. SAP manufacturing companies using Snowflake and AWS">
+    <button type="submit">Search</button>
+    <span class="htmx-indicator" id="spin">parsing…</span>
+  </form>
+
+  <p class="examples">
+    Try:
+    <button onclick="demo('SAP manufacturing companies using Snowflake and AWS')">SAP manufacturers using Snowflake and AWS</button>·
+    <button onclick="demo('manufacturers hiring for dbt and Kafka last quarter')">manufacturers hiring for dbt and Kafka last quarter</button>·
+    <button onclick="demo('SAP shops hiring dbt engineers')">SAP shops hiring dbt engineers</button>
+  </p>
+
+  <div id="results">
+    <div class="empty-state">Ask a question to begin.</div>
+  </div>
+
+  <footer>
+    The query is parsed by an LLM into chips, and <b>nothing after that is an LLM</b>: retrieval is
+    lexical <code>ts_rank</code> + exact cosine, fused with reciprocal rank fusion, then scored by a
+    fixed formula. Identical chips always return an identical ranking.<br>
+    Terms never filter — they score. A company matching 1 of 3 terms is ranked lower, never dropped.
+  </footer>
+
+</div>
+
+<script>
+  function demo(q) {
+    const box = document.getElementById('q');
+    box.value = q;
+    box.closest('form').requestSubmit();
+  }
+
+  // Chip editing. Every mutation re-submits the chips form, which posts to /ui/refine — the
+  // deterministic path. Correcting a bad parse therefore cannot be re-guessed by the model.
+  function chipsForm() { return document.getElementById('chips'); }
+  function rerun() { const f = chipsForm(); if (f) f.requestSubmit(); }
+
+  function removeChip(btn) {
+    btn.closest('.chip').remove();
+    rerun();
+  }
+
+  function addTerm() {
+    const input = document.getElementById('new-term');
+    const value = input.value.trim();
+    if (!value) return;
+
+    const chip = document.createElement('span');
+    chip.className = 'chip';
+
+    const hidden = document.createElement('input');
+    hidden.type = 'hidden';
+    hidden.name = 'term_value';
+    hidden.value = value;
+
+    const label = document.createElement('span');
+    label.className = 'chip-label';
+    label.textContent = value;
+
+    const select = document.createElement('select');
+    select.name = 'term_source';
+    select.setAttribute('onchange', 'rerun()');
+    for (const s of ['ANY', 'USES', 'HIRING']) {
+      const opt = document.createElement('option');
+      opt.value = s;
+      opt.textContent = s === 'USES' ? 'uses' : (s === 'HIRING' ? 'hiring for' : 'either');
+      select.appendChild(opt);
+    }
+
+    const x = document.createElement('button');
+    x.type = 'button';
+    x.className = 'x';
+    x.textContent = '×';
+    x.setAttribute('onclick', 'removeChip(this)');
+
+    chip.append(hidden, label, select, x);
+    document.getElementById('chip-list').appendChild(chip);
+    input.value = '';
+    rerun();
+  }
+</script>
+</body>
+</html>

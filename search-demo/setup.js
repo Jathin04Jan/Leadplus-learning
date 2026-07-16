@@ -18,13 +18,15 @@ import { config } from './config.js';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const sql = fs.readFileSync(path.join(here, 'schema.sql'), 'utf8');
 
-// This script is destructive. Refuse to run against anything but a *demo* database, so a
-// stray DATABASE_URL can never drop the real `leadplus` schema.
+// This script is destructive. Allowlist the throwaway databases by name, so a stray
+// DATABASE_URL can never drop `leadplus`, `leadplus_dev` or `leadplus_prod`.
+//   *demo*  -> leadplus_demo   (the local synthetic replica)
+//   *local* -> leadplus_local  (the pgvector instance the intent-search app reads)
 const dbName = (config.databaseUrl.split('/').pop() || '').split('?')[0];
-if (!/demo/i.test(dbName)) {
+if (!/demo|local/i.test(dbName)) {
   console.error(
-    `refusing to drop schema on database "${dbName}" — setup.js only runs against a *demo* database.\n` +
-      'Point DATABASE_URL at leadplus_demo (or another db whose name contains "demo").',
+    `refusing to drop schema on database "${dbName}" — setup.js only runs against a *demo* or *local* database.\n` +
+      'Point DATABASE_URL at leadplus_demo or leadplus_local.',
   );
   process.exit(1);
 }

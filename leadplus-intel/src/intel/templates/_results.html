@@ -1,0 +1,196 @@
+{# §6[1]/§13 phase 8 — the chips are editable because a wrong parse must be a one-click fix. #}
+{% set c = r.chips %}
+
+{% for n in r.notes %}
+  <div class="note">{{ n }}</div>
+{% endfor %}
+
+<form class="panel" id="chips" hx-post="/ui/refine" hx-target="#results" hx-swap="innerHTML">
+  <h2>Parsed query {% if llm_used %}· from the LLM{% else %}· edited by you{% endif %}</h2>
+  <p class="hint">
+    This is what the search actually ran. Wrong? Fix it here — edits re-run instantly and
+    <b>never call the LLM again</b>.
+  </p>
+
+  <input type="hidden" name="q" value="{{ q }}">
+  <input type="hidden" name="limit" value="20">
+  {# Preserved across refines even though the UI has no editor for them. #}
+  {% if c.min_employees is not none %}<input type="hidden" name="min_employees" value="{{ c.min_employees }}">{% endif %}
+  {% if c.max_employees is not none %}<input type="hidden" name="max_employees" value="{{ c.max_employees }}">{% endif %}
+  {% if c.min_revenue_usd is not none %}<input type="hidden" name="min_revenue_usd" value="{{ c.min_revenue_usd }}">{% endif %}
+  {% if c.max_revenue_usd is not none %}<input type="hidden" name="max_revenue_usd" value="{{ c.max_revenue_usd }}">{% endif %}
+
+  <div class="chip-list" id="chip-list">
+    {% for t in c.terms %}
+      <span class="chip">
+        <input type="hidden" name="term_value" value="{{ t.value }}">
+        <span class="chip-label">{{ t.value }}</span>
+        <select name="term_source" onchange="rerun()" title="Which side of the corpus answers this term">
+          {% for s in sources %}
+            <option value="{{ s }}" {% if t.source.value == s %}selected{% endif %}>
+              {{ {'USES': 'uses', 'HIRING': 'hiring for', 'ANY': 'either'}[s] }}
+            </option>
+          {% endfor %}
+        </select>
+        <button type="button" class="x" onclick="removeChip(this)" title="Remove this term">×</button>
+      </span>
+    {% else %}
+      <span class="chip empty">no terms — ranking on the query's meaning alone</span>
+    {% endfor %}
+  </div>
+
+  <div class="fields">
+    <div class="field">
+      <label title="A soft multiplier — never a filter">Industry (soft)</label>
+      <input type="text" name="industry" value="{{ c.industry or '' }}" onchange="rerun()"
+             placeholder="any">
+    </div>
+    <div class="field">
+      <label title="A hard filter on posted_date — a fact">Posted within (days)</label>
+      <input type="number" name="since_days" value="{{ c.since_days if c.since_days is not none else '' }}"
+             onchange="rerun()" placeholder="any" min="1">
+    </div>
+    <div class="field">
+      <label title="Selects the weight profile (§8.2)">Intent mode</label>
+      <select name="intent_mode" onchange="rerun()">
+        {% for m in modes %}
+          <option value="{{ m }}" {% if c.intent_mode.value == m %}selected{% endif %}>{{ m|lower }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label>Function</label>
+      <select name="function" onchange="rerun()">
+        <option value="">any</option>
+        {% for f in functions %}
+          <option value="{{ f }}" {% if c.function and c.function.value == f %}selected{% endif %}>{{ f|lower|replace('_',' ') }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label>Seniority</label>
+      <select name="seniority" onchange="rerun()">
+        <option value="">any</option>
+        {% for s in seniorities %}
+          <option value="{{ s }}" {% if c.seniority and c.seniority.value == s %}selected{% endif %}>{{ s|lower }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label>Add a term</label>
+      <div class="add-term">
+        <input type="text" id="new-term" placeholder="e.g. Kafka"
+               onkeydown="if(event.key==='Enter'){event.preventDefault();addTerm();}">
+        <button type="button" class="ghost" onclick="addTerm()">+</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="paraphrase">
+    Embedded as (rule 4 — the query is normalized the same way the documents were):
+    <code>{{ r.query_paraphrase }}</code>
+  </div>
+</form>
+
+<div class="meta">
+  <span>
+    <b>{{ r.companies|length }}</b> shown of <b>{{ r.total_candidates }}</b> candidates retrieved
+  </span>
+  <span class="timing">
+    {% for k, v in r.timing_ms.items() %}<code>{{ k }}={{ v }}</code>{% if not loop.last %} · {% endif %}{% endfor %}
+  </span>
+</div>
+
+{% if not r.companies %}
+  <div class="empty-state">
+    No companies retrieved. Widen the date window or remove a filter — note that terms never
+    filter, so an empty result means the hard filters excluded everything.
+  </div>
+{% endif %}
+
+{% for co in r.companies %}
+  {% set b = co.breakdown %}
+  <div class="card">
+    <div class="card-head">
+      <div>
+        <h3><span class="rank">#{{ loop.index }}</span>{{ co.name or 'company ' ~ co.company_id }}</h3>
+        <p class="card-sub">
+          {{ co.industry_canonical or co.industry_raw or 'industry unknown' }}
+          {%- if co.domain %} · {{ co.domain }}{% endif %}
+          · {{ b.matched_count }}/{{ b.asked_count }} terms
+          {%- if b.distinct_roles %} · {{ b.distinct_roles }} distinct role{{ 's' if b.distinct_roles != 1 }}{% endif %}
+          {%- if b.days_since_latest_post is not none %} · last posted {{ b.days_since_latest_post }}d ago{% endif %}
+        </p>
+      </div>
+      <div class="score">
+        <div class="n">{{ '%.3f'|format(co.score) }}</div>
+        <div class="l">{{ b.intent_mode.value|lower }}</div>
+      </div>
+    </div>
+
+    <p class="company-para">{{ co.paraphrase }}</p>
+
+    {% if b.matched_terms or b.unmatched_terms %}
+      <div class="terms">
+        {% for t in b.matched_terms %}<span class="tag hit">✓ {{ t }}</span>{% endfor %}
+        {% for t in b.unmatched_terms %}<span class="tag miss">{{ t }}</span>{% endfor %}
+      </div>
+    {% endif %}
+
+    <details class="why">
+      <summary>Why this score</summary>
+      <table class="axes">
+        {% for name, value in [('coverage', b.coverage), ('recency', b.recency), ('volume', b.volume), ('best_doc', b.best_doc)] %}
+          {% set w = b.weights[name] %}
+          <tr class="{{ 'dead' if w == 0 }}">
+            <td class="name">{{ name }}</td>
+            <td class="num">{{ '%.3f'|format(value) }}</td>
+            <td class="num">× {{ '%.2f'|format(w) }}</td>
+            <td class="num">= {{ '%.3f'|format(value * w) }}</td>
+            <td class="bar"><div class="bar"><i class="{{ 'on' if w > 0 }}" style="width: {{ (value * 100)|round|int }}%"></i></div></td>
+            <td class="note">{% if w == 0 %}zeroed by {{ b.intent_mode.value|lower }} mode{% endif %}</td>
+          </tr>
+        {% endfor %}
+        <tr class="sum">
+          <td class="name">subtotal</td>
+          <td class="num"></td><td class="num"></td>
+          <td class="num">{{ '%.3f'|format(b.weighted_subtotal) }}</td>
+          <td class="bar"></td><td class="note"></td>
+        </tr>
+        <tr>
+          <td class="name">× industry</td>
+          <td class="num"></td><td class="num"></td>
+          <td class="num">{{ '%.2f'|format(b.industry_multiplier) }}</td>
+          <td class="bar"></td>
+          <td class="note">{{ b.industry_rule }}</td>
+        </tr>
+        <tr class="sum">
+          <td class="name"><b>score</b></td>
+          <td class="num"></td><td class="num"></td>
+          <td class="num"><b>{{ '%.3f'|format(co.score) }}</b></td>
+          <td class="bar"></td>
+          <td class="note">rrf {{ '%.4f'|format(b.rrf_score) }}</td>
+        </tr>
+      </table>
+    </details>
+
+    {% if co.evidence %}
+      <div class="evidence">
+        <h4>Evidence — {{ co.evidence|length }} posting{{ 's' if co.evidence|length != 1 }}</h4>
+        {% for e in co.evidence %}
+          <div class="job">
+            <div class="job-head">
+              <span class="job-title">{{ e.title or e.job_id }}</span>
+              <span class="job-date">
+                {% if e.posted_date %}{{ e.posted_date.strftime('%d %b %Y') }}{% endif %}
+                {%- if e.days_ago is not none %} · {{ e.days_ago }}d ago{% endif %}
+              </span>
+              {% for t in e.matched_terms %}<span class="tag hit">✓ {{ t }}</span>{% endfor %}
+            </div>
+            <p class="job-para">{{ e.paraphrase }}</p>
+          </div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  </div>
+{% endfor %}

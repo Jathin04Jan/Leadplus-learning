@@ -1,0 +1,33 @@
+# Standalone environment for LeadPlus Intent Search (ARCHITECTURE.md §12).
+# Deliberately separate from the `leadplus-pg` container: this one carries pgvector, which
+# the semantic retriever needs, and nothing here may touch the other database.
+services:
+  db:
+    image: pgvector/pgvector:pg15
+    container_name: leadplus-intel-pg
+    environment:
+      POSTGRES_USER: leadplus
+      POSTGRES_PASSWORD: leadplus
+      POSTGRES_DB: leadplus_local
+    ports: ["5433:5432"]
+    volumes: ["intel-pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U leadplus -d leadplus_local"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: leadplus-intel-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@leadplus.ai
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+    ports: ["5050:80"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  intel-pgdata:

@@ -1,0 +1,1102 @@
+"""The seam (ARCHITECTURE.md §11).
+
+EVERY raw query in this project lives in this file, behind a narrow interface, so the source can
+swap from this synthetic restore to a real one with nothing above it changing. psycopg 3, raw
+SQL, explicit column lists, no ORM.
+
+Read/write discipline (§2, §7):
+  * `lead_company`, `lead_company_job`, `lead_query` are READ-ONLY. Nothing here writes them.
+  * We write only our own derived tables: company_canonical, job_signal, company_signal,
+    tech_canonical, tech_review_queue, ingest_dead_letter.
+
+pgvector note: `pgvector-python` is not installed, so vectors cross the wire as their text
+literal (`'[0.1,0.2,...]'`) with an explicit `::vector` cast. `_vec()` is the single place that
+formatting happens.
+"""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from typing import Any, Iterable, Iterator, Sequence
+
+import psycopg
+from psycopg.rows import dict_row
+
+from . import config
+from .models import CanonicalCompany, CompanySignalRow, CompanySource, JobSignalRow, JobSource
+
+# Tables we are forbidden from writing. Asserted by `assert_read_only_respected()`.
+LEADPLUS_TABLES = ("lead_company", "lead_company_job", "lead_query", "lead_contact")
+
+
+def _vec(values: Sequence[float] | None) -> str | None:
+    """Render a float list as a pgvector text literal, for use with an explicit `::vector` cast."""
+    if values is None:
+        return None
+    return "[" + ",".join(f"{v:.8f}" for v in values) + "]"
+
+
+@contextmanager
+def connect(autocommit: bool = True) -> Iterator[psycopg.Connection]:
+    """Open a connection with dict rows. Short-lived by design — this is a batch app."""
+    with psycopg.connect(config.DATABASE_URL, row_factory=dict_row, autocommit=autocommit) as conn:
+        yield conn
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 — schema + health
+# ---------------------------------------------------------------------------
+
+
+def apply_schema(conn: psycopg.Connection) -> None:
+    """Apply sql/schema.sql. Idempotent — every statement is IF NOT EXISTS."""
+    ddl = (config.SQL_DIR / "schema.sql").read_text(encoding="utf-8")
+    conn.execute(ddl)
+
+
+def health(conn: psycopg.Connection) -> dict[str, Any]:
+    """Everything `/api/health` needs: db reachable, pgvector present, derived tables present."""
+    row = conn.execute("SELECT version() AS pg_version").fetchone()
+    pg_version = (row or {}).get("pg_version", "").split(",")[0]
+
+    row = conn.execute(
+        "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
+    ).fetchone()
+    vector_version = (row or {}).get("extversion")
+
+    tables: dict[str, int | None] = {}
+    for table in (
+        "company_canonical",
+        "job_signal",
+        "company_signal",
+        "tech_canonical",
+        "tech_review_queue",
+        "ingest_dead_letter",
+    ):
+        exists = conn.execute("SELECT to_regclass(%s) AS reg", (table,)).fetchone()
+        tables[table] = (
+            conn.execute(f"SELECT count(*) AS n FROM {table}").fetchone()["n"]  # type: ignore[index]
+            if (exists or {}).get("reg")
+            else None
+        )
+
+    ok = bool(vector_version) and all(v is not None for v in tables.values())
+    return {
+        "status": "ok" if ok else "degraded",
+        "postgres": pg_version,
+        "pgvector": vector_version,
+        "tables": tables,
+    }
+
+
+def assert_read_only_respected(conn: psycopg.Connection) -> list[str]:
+    """Belt-and-braces: confirm no trigger/rule of ours hangs off a LeadPlus table."""
+    rows = conn.execute(
+        """
+        SELECT c.relname AS table_name, t.tgname AS trigger_name
+        FROM pg_trigger t
+        JOIN pg_class c ON c.oid = t.tgrelid
+        WHERE NOT t.tgisinternal AND c.relname = ANY(%s)
+        """,
+        (list(LEADPLUS_TABLES),),
+    ).fetchall()
+    return [f"{r['table_name']}.{r['trigger_name']}" for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# §15 — profiling
+# ---------------------------------------------------------------------------
+
+
+def profile_companies_with_jobs(conn: psycopg.Connection) -> int:
+    row = conn.execute(
+        "SELECT count(DISTINCT lead_company_id) AS n FROM lead_company_job WHERE active"
+    ).fetchone()
+    return row["n"]  # type: ignore[index]
+
+
+def profile_jobs_by_month(conn: psycopg.Connection) -> list[dict[str, Any]]:
+    return conn.execute(
+        """
+        SELECT date_trunc('month', posted_date) AS m, count(*) AS n
+        FROM lead_company_job
+        WHERE active AND posted_date IS NOT NULL
+        GROUP BY 1 ORDER BY 1 DESC
+        """
+    ).fetchall()
+
+
+def profile_jobs(conn: psycopg.Connection) -> dict[str, Any]:
+    return conn.execute(
+        """
+        SELECT count(*) AS total,
+               count(*) FILTER (WHERE cardinality(technologies) > 0) AS with_tech,
+               count(*) FILTER (WHERE length(description) > 200) AS with_description,
+               avg(length(description))::int AS avg_description_len
+        FROM lead_company_job WHERE active
+        """
+    ).fetchone()  # type: ignore[return-value]
+
+
+def profile_company_rows(conn: psycopg.Connection) -> dict[str, Any]:
+    return conn.execute(
+        """
+        SELECT count(*) AS total,
+               count(*) FILTER (WHERE cardinality(technologies) > 0) AS with_apollo_tech,
+               count(*) FILTER (WHERE cardinality(scraped_technologies) > 0) AS with_scraped_tech
+        FROM lead_company WHERE active
+        """
+    ).fetchone()  # type: ignore[return-value]
+
+
+def profile_copy_on_write(conn: psycopg.Connection) -> dict[str, Any]:
+    """§5.4's verification inputs — is copy-on-write actually populated in this restore?"""
+    return conn.execute(
+        """
+        SELECT count(*) AS active_companies,
+               count(*) FILTER (WHERE tenant_id IS NULL) AS shared_rows,
+               count(*) FILTER (WHERE exclusion) AS excluded,
+               count(*) FILTER (WHERE domain IS NULL) AS without_domain,
+               count(DISTINCT lower(domain)) AS distinct_domains
+        FROM lead_company WHERE active
+        """
+    ).fetchone()  # type: ignore[return-value]
+
+
+def profile_industries(conn: psycopg.Connection) -> list[dict[str, Any]]:
+    return conn.execute(
+        """
+        SELECT industry, count(*) AS n
+        FROM lead_company WHERE active
+        GROUP BY 1 ORDER BY 2 DESC
+        """
+    ).fetchall()
+
+
+def profile_lead_query_types(conn: psycopg.Connection) -> list[dict[str, Any]]:
+    return conn.execute(
+        "SELECT type, count(*) AS n FROM lead_query GROUP BY 1 ORDER BY 2 DESC"
+    ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# §5.4 — canonical company resolution
+# ---------------------------------------------------------------------------
+
+
+def fetch_companies_for_fold(conn: psycopg.Connection) -> list[dict[str, Any]]:
+    """All active companies with the fields the fold needs.
+
+    Deliberately NOT filtered on `exclusion`: exclusion is a per-tenant list-hygiene flag, not a
+    statement that the company is unreal. Dropping those rows here would silently shrink the
+    canonical set and desync `job_signal.company_id` for their jobs.
+    """
+    return conn.execute(
+        """
+        SELECT id, lower(trim(domain)) AS domain_key, domain, tenant_id, name
+        FROM lead_company
+        WHERE active
+        ORDER BY id
+        """
+    ).fetchall()
+
+
+def count_active_lead_companies(conn: psycopg.Connection) -> int:
+    row = conn.execute("SELECT count(*) AS n FROM lead_company WHERE active").fetchone()
+    return row["n"]  # type: ignore[index]
+
+
+def replace_company_canonical(
+    conn: psycopg.Connection, groups: Iterable[CanonicalCompany]
+) -> int:
+    """Rebuild `company_canonical` wholesale. The fold is a pure function of `lead_company`."""
+    rows = [(g.canonical_id, g.domain, g.member_ids) for g in groups]
+    with conn.transaction():
+        conn.execute("TRUNCATE company_canonical")
+        with conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO company_canonical (canonical_id, domain, member_ids)
+                VALUES (%s, %s, %s)
+                """,
+                rows,
+            )
+    return len(rows)
+
+
+def count_company_canonical(conn: psycopg.Connection) -> int:
+    row = conn.execute("SELECT count(*) AS n FROM company_canonical").fetchone()
+    return row["n"]  # type: ignore[index]
+
+
+def canonical_member_map(conn: psycopg.Connection) -> dict[int, int]:
+    """member lead_company.id -> canonical_id. The §5.4 contract for every downstream write."""
+    rows = conn.execute(
+        "SELECT canonical_id, member_ids FROM company_canonical"
+    ).fetchall()
+    return {member: r["canonical_id"] for r in rows for member in r["member_ids"]}
+
+
+def fetch_canonical_companies(conn: psycopg.Connection) -> list[CanonicalCompany]:
+    rows = conn.execute(
+        "SELECT canonical_id, domain, member_ids FROM company_canonical ORDER BY canonical_id"
+    ).fetchall()
+    return [CanonicalCompany(**r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# §5.2 stage 1 — job extract
+# ---------------------------------------------------------------------------
+
+
+def fetch_jobs_to_normalize(
+    conn: psycopg.Connection,
+    *,
+    cursor: int,
+    prompt_version: str,
+    model: str,
+    limit: int = config.FETCH_BATCH_SIZE,
+) -> list[JobSource]:
+    """§5.2 stage 1, verbatim: keyset pagination + the NOT EXISTS resumability clause.
+
+    The NOT EXISTS is what makes this cheap to re-run and what makes a prompt bump a delta
+    rather than a full re-spend. It is also the checkpoint: there is no separate checkpoint
+    table because already-written rows *are* the checkpoint.
+    """
+    rows = conn.execute(
+        """
+        SELECT j.id, j.lead_company_id, j.title, j.description, j.department, j.location,
+               j.type, j.posted_date, j.skills, j.requirements, j.technologies, j.tools,
+               j.services, c.name AS company_name, c.industry, c.employee_range
+        FROM lead_company_job j
+        JOIN lead_company c ON c.id = j.lead_company_id
+        WHERE j.active AND c.active
+          AND j.id > %(cursor)s
+          AND NOT EXISTS (
+            SELECT 1 FROM job_signal s
+            WHERE s.job_id = j.id AND s.prompt_version = %(prompt_version)s AND s.model = %(model)s
+          )
+        ORDER BY j.id
+        LIMIT %(limit)s
+        """,
+        {"cursor": cursor, "prompt_version": prompt_version, "model": model, "limit": limit},
+    ).fetchall()
+    return [JobSource(**{k: (v if v is not None else _default(k)) for k, v in r.items()}) for r in rows]
+
+
+def _default(key: str) -> Any:
+    """Array columns are nullable in LeadPlus; the model wants [] not None."""
+    return [] if key in {"skills", "requirements", "technologies", "tools", "services"} else None
+
+
+def count_ingestable_jobs(conn: psycopg.Connection) -> int:
+    """The denominator for the ingest report: active jobs at active companies."""
+    row = conn.execute(
+        """
+        SELECT count(*) AS n
+        FROM lead_company_job j JOIN lead_company c ON c.id = j.lead_company_id
+        WHERE j.active AND c.active
+        """
+    ).fetchone()
+    return row["n"]  # type: ignore[index]
+
+
+# ---------------------------------------------------------------------------
+# §5.3 / §5.4 — company extract, unioned across member_ids
+# ---------------------------------------------------------------------------
+
+
+def fetch_companies_to_normalize(
+    conn: psycopg.Connection,
+    *,
+    cursor: int,
+    prompt_version: str,
+    model: str,
+    limit: int = config.FETCH_BATCH_SIZE,
+) -> list[CompanySource]:
+    """One row per canonical company, structured fields unioned across all `member_ids` (§5.4).
+
+    Scalar fields come from the canonical row itself; array fields (`technologies`, `keywords`,
+    `scraped_*`) are unioned across members, because a per-tenant copy may carry enrichment the
+    shared row lacks.
+
+    `notes`, `account_summary` and `salesperson_name` are NEVER selected (§3, §5.3) — internal
+    free-text that may contain personal data. `lead_contact` is not touched at all.
+    """
+    rows = conn.execute(
+        """
+        SELECT cc.canonical_id,
+               cc.member_ids,
+               cc.domain,
+               c.name,
+               c.industry,
+               c.hq_city,
+               c.hq_state,
+               c.hq_country,
+               c.region,
+               c.employee_count,
+               c.employee_range,
+               c.revenue_usd,
+               u.keywords,
+               u.technologies,
+               u.scraped_technologies,
+               u.scraped_tools,
+               u.scraped_services
+        FROM company_canonical cc
+        JOIN lead_company c ON c.id = cc.canonical_id
+        CROSS JOIN LATERAL (
+          -- Union each array column across all member rows independently. Unnesting them in
+          -- one pass would cartesian-product the columns against each other.
+          SELECT
+            COALESCE((SELECT array_agg(DISTINCT x) FROM lead_company m,
+                        unnest(m.keywords) AS x WHERE m.id = ANY(cc.member_ids)), '{}')             AS keywords,
+            COALESCE((SELECT array_agg(DISTINCT x) FROM lead_company m,
+                        unnest(m.technologies) AS x WHERE m.id = ANY(cc.member_ids)), '{}')         AS technologies,
+            COALESCE((SELECT array_agg(DISTINCT x) FROM lead_company m,
+                        unnest(m.scraped_technologies) AS x WHERE m.id = ANY(cc.member_ids)), '{}') AS scraped_technologies,
+            COALESCE((SELECT array_agg(DISTINCT x) FROM lead_company m,
+                        unnest(m.scraped_tools) AS x WHERE m.id = ANY(cc.member_ids)), '{}')        AS scraped_tools,
+            COALESCE((SELECT array_agg(DISTINCT x) FROM lead_company m,
+                        unnest(m.scraped_services) AS x WHERE m.id = ANY(cc.member_ids)), '{}')     AS scraped_services
+        ) u
+        WHERE cc.canonical_id > %(cursor)s
+          AND NOT EXISTS (
+            SELECT 1 FROM company_signal s
+            WHERE s.company_id = cc.canonical_id
+              AND s.prompt_version = %(prompt_version)s AND s.model = %(model)s
+          )
+        ORDER BY cc.canonical_id
+        LIMIT %(limit)s
+        """,
+        {"cursor": cursor, "prompt_version": prompt_version, "model": model, "limit": limit},
+    ).fetchall()
+    out: list[CompanySource] = []
+    for r in rows:
+        r = dict(r)
+        if r.get("revenue_usd") is not None:
+            r["revenue_usd"] = float(r["revenue_usd"])
+        out.append(CompanySource(**r))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# §5.2 stage 5 — load
+# ---------------------------------------------------------------------------
+
+
+def upsert_job_signals(conn: psycopg.Connection, rows: Sequence[JobSignalRow]) -> int:
+    """Single upsert keyed on `job_id` (§5.2 stage 5) — a crash mid-batch leaves no partial rows."""
+    if not rows:
+        return 0
+    params = [
+        (
+            r.job_id,
+            r.company_id,
+            r.initiative,
+            r.function,
+            r.seniority,
+            r.engagement_type,
+            r.technologies,
+            r.paraphrase,
+            r.confidence,
+            r.title_norm,
+            r.is_repost,
+            _vec(r.embedding),
+            r.posted_date,
+            r.prompt_version,
+            r.model,
+        )
+        for r in rows
+    ]
+    with conn.transaction(), conn.cursor() as cur:
+        cur.executemany(
+            """
+            INSERT INTO job_signal (
+              job_id, company_id, initiative, function, seniority, engagement_type,
+              technologies, paraphrase, confidence, title_norm, is_repost, embedding,
+              posted_date, prompt_version, model, run_at
+            ) VALUES (
+              %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector, %s, %s, %s, now()
+            )
+            ON CONFLICT (job_id) DO UPDATE SET
+              company_id      = EXCLUDED.company_id,
+              initiative      = EXCLUDED.initiative,
+              function        = EXCLUDED.function,
+              seniority       = EXCLUDED.seniority,
+              engagement_type = EXCLUDED.engagement_type,
+              technologies    = EXCLUDED.technologies,
+              paraphrase      = EXCLUDED.paraphrase,
+              confidence      = EXCLUDED.confidence,
+              title_norm      = EXCLUDED.title_norm,
+              is_repost       = EXCLUDED.is_repost,
+              embedding       = EXCLUDED.embedding,
+              posted_date     = EXCLUDED.posted_date,
+              prompt_version  = EXCLUDED.prompt_version,
+              model           = EXCLUDED.model,
+              run_at          = now()
+            """,
+            params,
+        )
+    return len(rows)
+
+
+def upsert_company_signals(conn: psycopg.Connection, rows: Sequence[CompanySignalRow]) -> int:
+    if not rows:
+        return 0
+    params = [
+        (
+            r.company_id,
+            r.paraphrase,
+            r.technologies,
+            r.industry_raw,
+            r.industry_canonical,
+            _vec(r.industry_embedding),
+            _vec(r.embedding),
+            r.prompt_version,
+            r.model,
+        )
+        for r in rows
+    ]
+    with conn.transaction(), conn.cursor() as cur:
+        cur.executemany(
+            """
+            INSERT INTO company_signal (
+              company_id, paraphrase, technologies, industry_raw, industry_canonical,
+              industry_embedding, embedding, prompt_version, model, run_at
+            ) VALUES (
+              %s, %s, %s, %s, %s, %s::vector, %s::vector, %s, %s, now()
+            )
+            ON CONFLICT (company_id) DO UPDATE SET
+              paraphrase         = EXCLUDED.paraphrase,
+              technologies       = EXCLUDED.technologies,
+              industry_raw       = EXCLUDED.industry_raw,
+              industry_canonical = EXCLUDED.industry_canonical,
+              industry_embedding = EXCLUDED.industry_embedding,
+              embedding          = EXCLUDED.embedding,
+              prompt_version     = EXCLUDED.prompt_version,
+              model              = EXCLUDED.model,
+              run_at             = now()
+            """,
+            params,
+        )
+    return len(rows)
+
+
+def record_dead_letter(
+    conn: psycopg.Connection,
+    *,
+    kind: str,
+    source_id: int,
+    prompt_version: str,
+    model: str,
+    error: str,
+    raw_response: str | None,
+) -> None:
+    """§5.7 failure isolation. Never raises — a dead-letter write must not kill the batch either."""
+    try:
+        conn.execute(
+            """
+            INSERT INTO ingest_dead_letter (kind, source_id, prompt_version, model, error, raw_response)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (kind, source_id, prompt_version, model) DO UPDATE SET
+              error = EXCLUDED.error, raw_response = EXCLUDED.raw_response, failed_at = now()
+            """,
+            (kind, source_id, prompt_version, model, error[:4000], (raw_response or "")[:8000] or None),
+        )
+    except Exception:  # noqa: BLE001 — deliberate: the dead-letter is best-effort.
+        pass
+
+
+def clear_dead_letters(
+    conn: psycopg.Connection, *, kind: str, source_ids: Sequence[int], prompt_version: str, model: str
+) -> None:
+    """A row that succeeds on retry should not linger in the dead-letter table."""
+    if not source_ids:
+        return
+    conn.execute(
+        """
+        DELETE FROM ingest_dead_letter
+        WHERE kind = %s AND source_id = ANY(%s) AND prompt_version = %s AND model = %s
+        """,
+        (kind, list(source_ids), prompt_version, model),
+    )
+
+
+def dead_letters(conn: psycopg.Connection) -> list[dict[str, Any]]:
+    return conn.execute(
+        """
+        SELECT kind, source_id, prompt_version, model, error, failed_at
+        FROM ingest_dead_letter ORDER BY failed_at DESC
+        """
+    ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# §5.6 — repost detection
+# ---------------------------------------------------------------------------
+
+
+def mark_reposts(conn: psycopg.Connection) -> int:
+    """§5.6: same (company_id, title_norm) within 90 days AND paraphrase cosine > 0.95.
+
+    The *earlier* posting is the original; later near-duplicates are the reposts. Both stay
+    retrievable — `is_repost` exists so `volume` (§8.3) can count distinct roles, not job rows.
+    """
+    with conn.transaction():
+        conn.execute("UPDATE job_signal SET is_repost = false")
+        row = conn.execute(
+            """
+            WITH pairs AS (
+              SELECT b.job_id
+              FROM job_signal a
+              JOIN job_signal b
+                ON b.company_id = a.company_id
+               AND b.title_norm = a.title_norm
+               AND b.job_id <> a.job_id
+               AND a.posted_date IS NOT NULL AND b.posted_date IS NOT NULL
+               AND b.posted_date > a.posted_date
+               AND b.posted_date - a.posted_date <= make_interval(days => %(window)s)
+              WHERE a.embedding IS NOT NULL AND b.embedding IS NOT NULL
+                AND (1 - (a.embedding <=> b.embedding)) > %(threshold)s
+            )
+            UPDATE job_signal s SET is_repost = true
+            WHERE s.job_id IN (SELECT job_id FROM pairs)
+            """,
+            {"window": config.REPOST_WINDOW_DAYS, "threshold": config.REPOST_COSINE_THRESHOLD},
+        )
+        marked = row.rowcount
+    return marked
+
+
+# ---------------------------------------------------------------------------
+# §5.2 stage 3 — tech_canonical + review queue
+# ---------------------------------------------------------------------------
+
+
+def distinct_apollo_technologies(conn: psycopg.Connection) -> list[str]:
+    """§5.2 stage 3 bootstrap source: Apollo's curated `lead_company.technologies[]`."""
+    rows = conn.execute(
+        """
+        SELECT DISTINCT trim(t) AS term
+        FROM lead_company, unnest(technologies) AS t
+        WHERE active AND trim(t) <> ''
+        ORDER BY 1
+        """
+    ).fetchall()
+    return [r["term"] for r in rows]
+
+
+def upsert_tech_canonical(
+    conn: psycopg.Connection, rows: Sequence[tuple[str, list[float] | None, list[str]]]
+) -> int:
+    if not rows:
+        return 0
+    params = [(term, _vec(emb), aliases) for term, emb, aliases in rows]
+    with conn.transaction(), conn.cursor() as cur:
+        cur.executemany(
+            """
+            INSERT INTO tech_canonical (term, embedding, aliases)
+            VALUES (%s, %s::vector, %s)
+            ON CONFLICT (term) DO UPDATE SET
+              embedding = COALESCE(EXCLUDED.embedding, tech_canonical.embedding),
+              aliases   = (
+                SELECT array_agg(DISTINCT a)
+                FROM unnest(COALESCE(tech_canonical.aliases, '{}') || EXCLUDED.aliases) AS a
+              )
+            """,
+            params,
+        )
+    return len(rows)
+
+
+def fetch_tech_canonical(conn: psycopg.Connection) -> list[dict[str, Any]]:
+    return conn.execute(
+        "SELECT term, aliases FROM tech_canonical ORDER BY term"
+    ).fetchall()
+
+
+def find_tech_exact(conn: psycopg.Connection, key: str) -> str | None:
+    """Exact match on the normalized key: lowercased, punctuation-stripped (§5.2 stage 3)."""
+    row = conn.execute(
+        """
+        SELECT term FROM tech_canonical
+        WHERE regexp_replace(lower(term), '[^a-z0-9]', '', 'g') = %s
+        LIMIT 1
+        """,
+        (key,),
+    ).fetchone()
+    return (row or {}).get("term")
+
+
+def find_tech_alias(conn: psycopg.Connection, key: str) -> str | None:
+    """Alias match against `tech_canonical.aliases` (§5.2 stage 3)."""
+    row = conn.execute(
+        """
+        SELECT term FROM tech_canonical
+        WHERE EXISTS (
+          SELECT 1 FROM unnest(COALESCE(aliases, '{}')) AS a
+          WHERE regexp_replace(lower(a), '[^a-z0-9]', '', 'g') = %s
+        )
+        LIMIT 1
+        """,
+        (key,),
+    ).fetchone()
+    return (row or {}).get("term")
+
+
+def find_tech_nearest(
+    conn: psycopg.Connection, embedding: Sequence[float]
+) -> tuple[str, float] | None:
+    """Embedding nearest-neighbour over `tech_canonical`.
+
+    Brute-force exact cosine, no index (rule 7) — the vocabulary is tens of rows.
+    Returns (term, cosine_similarity); the >0.85 decision is the caller's (§5.2 stage 3).
+    """
+    row = conn.execute(
+        """
+        SELECT term, 1 - (embedding <=> %s::vector) AS similarity
+        FROM tech_canonical
+        WHERE embedding IS NOT NULL
+        ORDER BY embedding <=> %s::vector
+        LIMIT 1
+        """,
+        (_vec(embedding), _vec(embedding)),
+    ).fetchone()
+    if not row:
+        return None
+    return row["term"], float(row["similarity"])
+
+
+def add_tech_alias(conn: psycopg.Connection, term: str, alias: str) -> None:
+    """Record a resolved alias so the next run hits the cheap path (§5.2 stage 3: 'hit + record alias')."""
+    conn.execute(
+        """
+        UPDATE tech_canonical
+        SET aliases = (
+          SELECT array_agg(DISTINCT a) FROM unnest(COALESCE(aliases, '{}') || ARRAY[%s]) AS a
+        )
+        WHERE term = %s
+        """,
+        (alias, term),
+    )
+
+
+def enqueue_tech_review(
+    conn: psycopg.Connection, *, raw_term: str, nearest: str | None, similarity: float | None
+) -> None:
+    """Unresolved term -> human queue, occurrences++. We NEVER auto-guess (§5.2 stage 3)."""
+    conn.execute(
+        """
+        INSERT INTO tech_review_queue (raw_term, nearest, similarity, occurrences)
+        VALUES (%s, %s, %s, 1)
+        ON CONFLICT (raw_term) DO UPDATE SET
+          occurrences = tech_review_queue.occurrences + 1,
+          nearest     = EXCLUDED.nearest,
+          similarity  = EXCLUDED.similarity
+        """,
+        (raw_term, nearest, similarity),
+    )
+
+
+def fetch_tech_review_queue(conn: psycopg.Connection) -> list[dict[str, Any]]:
+    return conn.execute(
+        """
+        SELECT raw_term, nearest, similarity, occurrences, resolved_to
+        FROM tech_review_queue ORDER BY occurrences DESC, raw_term
+        """
+    ).fetchall()
+
+
+def clear_tech_review_queue(conn: psycopg.Connection) -> None:
+    conn.execute("TRUNCATE tech_review_queue")
+
+
+# ---------------------------------------------------------------------------
+# Applying canonical technologies back onto the signal rows
+# ---------------------------------------------------------------------------
+
+
+def fetch_job_signal_technologies(conn: psycopg.Connection) -> list[dict[str, Any]]:
+    return conn.execute(
+        "SELECT job_id, technologies FROM job_signal ORDER BY job_id"
+    ).fetchall()
+
+
+def fetch_company_signal_technologies(conn: psycopg.Connection) -> list[dict[str, Any]]:
+    return conn.execute(
+        "SELECT company_id, technologies FROM company_signal ORDER BY company_id"
+    ).fetchall()
+
+
+def update_job_signal_technologies(
+    conn: psycopg.Connection, updates: Sequence[tuple[int, list[str]]]
+) -> int:
+    if not updates:
+        return 0
+    with conn.transaction(), conn.cursor() as cur:
+        cur.executemany(
+            "UPDATE job_signal SET technologies = %s WHERE job_id = %s",
+            [(techs, job_id) for job_id, techs in updates],
+        )
+    return len(updates)
+
+
+def update_company_signal_technologies(
+    conn: psycopg.Connection, updates: Sequence[tuple[int, list[str]]]
+) -> int:
+    if not updates:
+        return 0
+    with conn.transaction(), conn.cursor() as cur:
+        cur.executemany(
+            "UPDATE company_signal SET technologies = %s WHERE company_id = %s",
+            [(techs, cid) for cid, techs in updates],
+        )
+    return len(updates)
+
+
+# ---------------------------------------------------------------------------
+# §5.5 — industry canonicalisation
+# ---------------------------------------------------------------------------
+
+
+def fetch_industry_vocabulary(conn: psycopg.Connection) -> list[str]:
+    """§5.5: reuse `lead_query WHERE type='COMPANY_INDUSTRY'`. Do NOT invent a second taxonomy."""
+    rows = conn.execute(
+        """
+        SELECT DISTINCT trim(value) AS value
+        FROM lead_query
+        WHERE type = 'COMPANY_INDUSTRY' AND value IS NOT NULL AND trim(value) <> ''
+        ORDER BY 1
+        """
+    ).fetchall()
+    return [r["value"] for r in rows]
+
+
+def fetch_company_industries(conn: psycopg.Connection) -> list[dict[str, Any]]:
+    return conn.execute(
+        "SELECT company_id, industry_raw FROM company_signal ORDER BY company_id"
+    ).fetchall()
+
+
+def update_company_industry(
+    conn: psycopg.Connection,
+    updates: Sequence[tuple[int, str | None, list[float] | None]],
+) -> int:
+    if not updates:
+        return 0
+    with conn.transaction(), conn.cursor() as cur:
+        cur.executemany(
+            """
+            UPDATE company_signal
+            SET industry_canonical = %s, industry_embedding = %s::vector
+            WHERE company_id = %s
+            """,
+            [(canonical, _vec(emb), cid) for cid, canonical, emb in updates],
+        )
+    return len(updates)
+
+
+# ---------------------------------------------------------------------------
+# Verification helpers
+# ---------------------------------------------------------------------------
+
+
+def verify_counts(conn: psycopg.Connection) -> dict[str, Any]:
+    """The acceptance proof: row counts, embedding presence, and actual vector dimensionality."""
+    return conn.execute(
+        """
+        SELECT
+          (SELECT count(*) FROM job_signal)                                          AS job_signal,
+          (SELECT count(*) FROM job_signal WHERE embedding IS NULL)                  AS job_signal_no_embedding,
+          (SELECT count(DISTINCT vector_dims(embedding)) FROM job_signal
+             WHERE embedding IS NOT NULL)                                            AS job_dim_variants,
+          (SELECT max(vector_dims(embedding)) FROM job_signal)                       AS job_dims,
+          (SELECT count(*) FROM job_signal WHERE is_repost)                          AS reposts,
+          (SELECT count(*) FROM company_signal)                                      AS company_signal,
+          (SELECT count(*) FROM company_signal WHERE embedding IS NULL)              AS company_signal_no_embedding,
+          (SELECT max(vector_dims(embedding)) FROM company_signal)                   AS company_dims,
+          (SELECT count(*) FROM company_signal WHERE industry_canonical IS NULL)     AS company_no_industry,
+          (SELECT count(*) FROM company_signal WHERE industry_embedding IS NULL)     AS company_no_industry_embedding,
+          (SELECT count(*) FROM company_canonical)                                   AS company_canonical,
+          (SELECT count(*) FROM tech_canonical)                                      AS tech_canonical,
+          (SELECT count(*) FROM tech_review_queue)                                   AS tech_review_queue,
+          (SELECT count(*) FROM ingest_dead_letter)                                  AS dead_letters
+        """
+    ).fetchone()  # type: ignore[return-value]
+
+
+def orphan_job_signals(conn: psycopg.Connection) -> int:
+    """§5.4 invariant: every `job_signal.company_id` is a canonical id."""
+    row = conn.execute(
+        """
+        SELECT count(*) AS n FROM job_signal s
+        WHERE NOT EXISTS (
+          SELECT 1 FROM company_canonical cc WHERE cc.canonical_id = s.company_id
+        )
+        """
+    ).fetchone()
+    return row["n"]  # type: ignore[index]
+
+
+def sample_signals(conn: psycopg.Connection, limit: int = 10) -> list[dict[str, Any]]:
+    return conn.execute(
+        """
+        SELECT job_id, company_id, initiative, function, seniority, engagement_type,
+               technologies, paraphrase, confidence, title_norm, is_repost, posted_date
+        FROM job_signal ORDER BY job_id LIMIT %s
+        """,
+        (limit,),
+    ).fetchall()
+
+
+def technology_histogram(conn: psycopg.Connection, table: str) -> list[dict[str, Any]]:
+    """Post-canonicalisation vocabulary check — used to prove no SAP S4 / S/4HANA splits (§5.5)."""
+    if table not in {"job_signal", "company_signal"}:
+        raise ValueError(f"refusing to interpolate unknown table: {table}")
+    return conn.execute(
+        f"""
+        SELECT t AS term, count(*) AS n
+        FROM {table}, unnest(technologies) AS t
+        GROUP BY 1 ORDER BY 2 DESC, 1
+        """
+    ).fetchall()
+
+
+def industry_histogram(conn: psycopg.Connection) -> list[dict[str, Any]]:
+    return conn.execute(
+        """
+        SELECT industry_raw, industry_canonical, count(*) AS n
+        FROM company_signal GROUP BY 1, 2 ORDER BY 3 DESC
+        """
+    ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# §6 — retrieval. NO LLM below this line; these four lists are pure SQL.
+#
+# Three things are load-bearing in every query here:
+#
+#   * **The hard filters are facts only** (§6[2], rule 2): `posted_date`, employee count and
+#     revenue. `industry` is deliberately absent — it is free text, and hard-filtering it would
+#     silently delete correct answers before ranking ever saw them (§8.5 down-weights instead).
+#     Terms are absent too: they feed coverage (§8.4), they never remove a row.
+#
+#   * **Every optional filter is expressed as `%(p)s::t IS NULL OR ...`** so the SQL stays static
+#     and one plan serves every shape of query. Each parameter is cast explicitly, because
+#     Postgres cannot infer a type for a bare NULL parameter.
+#
+#   * **Every ORDER BY ends in a unique-column tiebreak.** Ties in `ts_rank` and in cosine are
+#     common, and without a tiebreak the row order — and therefore the rank passed to RRF — is
+#     whatever the executor felt like. That would make identical chips return a different
+#     ranking on a re-run, which is the exact defect this project exists to fix.
+#
+# The embedding columns have no index, by rule 7: exact brute-force cosine over 386+301 rows is
+# both faster and more accurate than ANN, and ANN composes badly with the pre-filters above.
+# ---------------------------------------------------------------------------
+
+# The job-side hard filters, shared verbatim by the lexical list, the semantic list, and the
+# evidence fetch. They must be identical in all three: a job that is filtered out of the lists
+# but back in the evidence would be scored as evidence for a match it never made.
+_JOB_FILTERS = """
+          AND (%(since_days)s::int IS NULL
+               OR j.posted_date >= now() - make_interval(days => %(since_days)s::int))
+          AND (%(function)s::text IS NULL OR j.function = %(function)s::text)
+          AND (%(seniority)s::text IS NULL OR j.seniority = %(seniority)s::text)
+"""
+
+# Firmographic facts live on `lead_company`, not on our derived tables, so both the job and the
+# company lists join to it to filter. `employee_count` is a varchar holding a number, hence the
+# digit-strip before the cast; a non-numeric value becomes NULL and fails the comparison rather
+# than raising.
+_FIRMO_FILTERS = """
+          AND (%(min_employees)s::bigint IS NULL
+               OR NULLIF(regexp_replace(c.employee_count, '[^0-9]', '', 'g'), '')::bigint
+                  >= %(min_employees)s::bigint)
+          AND (%(max_employees)s::bigint IS NULL
+               OR NULLIF(regexp_replace(c.employee_count, '[^0-9]', '', 'g'), '')::bigint
+                  <= %(max_employees)s::bigint)
+          AND (%(min_revenue_usd)s::numeric IS NULL OR c.revenue_usd >= %(min_revenue_usd)s::numeric)
+          AND (%(max_revenue_usd)s::numeric IS NULL OR c.revenue_usd <= %(max_revenue_usd)s::numeric)
+"""
+
+# §6[3a]'s tsquery, built from the chip phrases.
+#
+# The phrases are OR'd, never AND'd. An AND here would re-create defect #1 from the other side:
+# the lexical list is a *candidate generator*, and a company matching two of three terms must
+# still enter the pool and be out-ranked by coverage — not be deleted by the retrieval SQL.
+#
+# `plainto_tsquery` per phrase handles lexing, stemming and escaping (so a phrase like
+# "SAP S/4HANA" cannot break the query or inject); rendering each back `::text` and re-parsing
+# the OR-joined result with `to_tsquery` is what lets the whole thing stay one static statement
+# with a single array parameter. The inner ORDER BY makes the assembled query string itself
+# byte-stable.
+_TSQUERY_CTE = """
+        WITH parts AS (
+          SELECT plainto_tsquery('english', p) AS t
+          FROM unnest(%(phrases)s::text[]) AS p
+        ), q AS (
+          SELECT to_tsquery('english', string_agg('(' || t::text || ')', ' | ' ORDER BY t::text))
+                 AS query
+          FROM parts
+          WHERE t::text <> ''
+        )
+"""
+
+
+def search_jobs_lexical(
+    conn: psycopg.Connection, *, phrases: Sequence[str], filters: dict[str, Any], limit: int = 200
+) -> list[dict[str, Any]]:
+    """§6[3a] list L1 — `ts_rank` over the `job_signal` GIN index, top 200."""
+    return conn.execute(
+        _TSQUERY_CTE
+        + f"""
+        SELECT j.job_id, j.company_id, ts_rank(j.tsv, q.query) AS score
+        FROM job_signal j
+        JOIN lead_company c ON c.id = j.company_id
+        CROSS JOIN q
+        WHERE q.query IS NOT NULL
+          AND j.tsv @@ q.query
+          {_JOB_FILTERS}
+          {_FIRMO_FILTERS}
+        ORDER BY score DESC, j.job_id
+        LIMIT %(limit)s
+        """,
+        {"phrases": list(phrases), "limit": limit, **filters},
+    ).fetchall()
+
+
+def search_jobs_semantic(
+    conn: psycopg.Connection, *, qvec: Sequence[float], filters: dict[str, Any], limit: int = 200
+) -> list[dict[str, Any]]:
+    """§6[3b] list L2 — exact cosine over `job_signal.embedding`. No ANN index (rule 7)."""
+    return conn.execute(
+        f"""
+        SELECT j.job_id, j.company_id, 1 - (j.embedding <=> %(qvec)s::vector) AS score
+        FROM job_signal j
+        JOIN lead_company c ON c.id = j.company_id
+        WHERE j.embedding IS NOT NULL
+          {_JOB_FILTERS}
+          {_FIRMO_FILTERS}
+        ORDER BY j.embedding <=> %(qvec)s::vector, j.job_id
+        LIMIT %(limit)s
+        """,
+        {"qvec": _vec(qvec), "limit": limit, **filters},
+    ).fetchall()
+
+
+def search_companies_lexical(
+    conn: psycopg.Connection, *, phrases: Sequence[str], filters: dict[str, Any], limit: int = 200
+) -> list[dict[str, Any]]:
+    """§6[3a] list L3 — `ts_rank` over `company_signal`. No date filter: companies have no `posted_date`."""
+    return conn.execute(
+        _TSQUERY_CTE
+        + f"""
+        SELECT cs.company_id, ts_rank(cs.tsv, q.query) AS score
+        FROM company_signal cs
+        JOIN lead_company c ON c.id = cs.company_id
+        CROSS JOIN q
+        WHERE q.query IS NOT NULL
+          AND cs.tsv @@ q.query
+          {_FIRMO_FILTERS}
+        ORDER BY score DESC, cs.company_id
+        LIMIT %(limit)s
+        """,
+        {"phrases": list(phrases), "limit": limit, **filters},
+    ).fetchall()
+
+
+def search_companies_semantic(
+    conn: psycopg.Connection, *, qvec: Sequence[float], filters: dict[str, Any], limit: int = 200
+) -> list[dict[str, Any]]:
+    """§6[3b] list L4 — exact cosine over `company_signal.embedding`."""
+    return conn.execute(
+        f"""
+        SELECT cs.company_id, 1 - (cs.embedding <=> %(qvec)s::vector) AS score
+        FROM company_signal cs
+        JOIN lead_company c ON c.id = cs.company_id
+        WHERE cs.embedding IS NOT NULL
+          {_FIRMO_FILTERS}
+        ORDER BY cs.embedding <=> %(qvec)s::vector, cs.company_id
+        LIMIT %(limit)s
+        """,
+        {"qvec": _vec(qvec), "limit": limit, **filters},
+    ).fetchall()
+
+
+def fetch_company_details(
+    conn: psycopg.Connection,
+    *,
+    company_ids: Sequence[int],
+    industry_vec: Sequence[float] | None = None,
+) -> list[dict[str, Any]]:
+    """The candidates' scoring inputs, plus §8.5's cosine.
+
+    `industry_similarity` is computed here, in SQL, rather than by shipping 1536 floats per
+    candidate into Python to dot-product them there. `industry_embedding` is `emb(industry_raw)`
+    written at ingest, so this is exactly §8.5's
+    `cosine(emb(company.industry_raw), emb(asked_industry))`. It is NULL when no industry was
+    asked for — in which case §8.5 returns 1.0 and never looks.
+    """
+    if not company_ids:
+        return []
+    return conn.execute(
+        """
+        SELECT cs.company_id,
+               c.name,
+               c.domain,
+               cs.paraphrase,
+               cs.technologies,
+               cs.industry_raw,
+               cs.industry_canonical,
+               CASE
+                 WHEN %(ivec)s::vector IS NULL OR cs.industry_embedding IS NULL THEN NULL
+                 ELSE 1 - (cs.industry_embedding <=> %(ivec)s::vector)
+               END AS industry_similarity
+        FROM company_signal cs
+        JOIN lead_company c ON c.id = cs.company_id
+        WHERE cs.company_id = ANY(%(ids)s::bigint[])
+        ORDER BY cs.company_id
+        """,
+        {"ids": list(company_ids), "ivec": _vec(industry_vec)},
+    ).fetchall()
+
+
+def fetch_jobs_for_companies(
+    conn: psycopg.Connection, *, company_ids: Sequence[int], filters: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Every surviving job for the candidate companies — coverage, recency, volume and evidence.
+
+    Filtered identically to the job lists (`_JOB_FILTERS`), so `since_days`/`function` narrow the
+    evidence and the axes computed from it, not just the retrieval.
+
+    `title` is joined back from `lead_company_job` because `job_signal` stores only `title_norm`
+    (lowercased, for §5.6's repost key), and evidence must show the posting as it was written.
+    That join is a read; §2's "never writes to LeadPlus tables" is untouched.
+    """
+    if not company_ids:
+        return []
+    return conn.execute(
+        f"""
+        SELECT j.job_id, j.company_id, jj.title, j.title_norm, j.paraphrase, j.technologies,
+               j.posted_date, j.function, j.seniority, j.initiative, j.is_repost, j.confidence
+        FROM job_signal j
+        JOIN lead_company c ON c.id = j.company_id
+        LEFT JOIN lead_company_job jj ON jj.id = j.job_id
+        WHERE j.company_id = ANY(%(ids)s::bigint[])
+          {_JOB_FILTERS}
+          {_FIRMO_FILTERS}
+        ORDER BY j.company_id, j.posted_date DESC NULLS LAST, j.job_id
+        """,
+        {"ids": list(company_ids), **filters},
+    ).fetchall()
+
+
+def fetch_known_technologies(conn: psycopg.Connection) -> list[dict[str, Any]]:
+    """The controlled technology vocabulary, for resolving a query term (rule 5).
+
+    Coverage (§8.4) needs to know whether "SAP" is a *canonical technology* or just a word, so it
+    can decide whether `technologies[]` or the prose is the authority for it. See score.py.
+    """
+    return conn.execute(
+        "SELECT term, COALESCE(aliases, '{}') AS aliases FROM tech_canonical ORDER BY term"
+    ).fetchall()
