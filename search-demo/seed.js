@@ -1,153 +1,275 @@
 /**
- * Standalone search demo — synthetic data generator.
+ * Standalone search demo — full synthetic replica of the LeadPlus production database.
  *
- * Generates a realistic lead pool so the search capability can be demoed before the real
- * `leadplus_dev` copy is available. Deterministic (fixed-seed PRNG) so every run produces
- * the same pool and demos are repeatable.
+ * Populates all 70 tables with domain-coherent US manufacturing / industrial GTM data so
+ * the demo DB looks and behaves like a real copy: every table has rows, no column is
+ * entirely NULL, and every *_id resolves to a row that exists.
  *
- * Data is shaped so the ANY-vs-ALL distinction is actually visible:
- *   - AWS is everywhere (~55%), so an ANY search floods.
- *   - Only a small, known set is Manufacturing + SAP + Snowflake + AWS, so an ALL search
- *     for "SAP, Snowflake, AWS" returns a precise, demo-able answer.
- * It also spreads technologies across the Apollo column (`technologies`) and the scraper
- * columns (`scraped_*`), mirroring how the real pool is populated by two different sources.
+ * Three properties this file is responsible for:
  *
- * Usage: node seed.js
+ *   DETERMINISM   — one fixed-seed LCG (seed/rng.js) drives every choice, so re-seeding
+ *                   reproduces the identical database. Never Math.random().
+ *   IDEMPOTENCE   — TRUNCATE ... RESTART IDENTITY across all 70 tables first, so
+ *                   `npm run seed` is repeatable rather than additive.
+ *   INTEGRITY     — the schema has ZERO foreign keys, so nothing here is checked by the
+ *                   database. Build order below IS the dependency graph: each builder is
+ *                   handed the real ids of its parents. Reordering it silently produces
+ *                   dangling references.
+ *
+ * The demo property (AWS everywhere -> ANY floods; a 12-row golden set -> ALL is precise;
+ * the "Sapient Consulting Group" near-miss) lives in seed/tables/leads.js.
+ *
+ * Usage: node seed.js   (or `npm run reset` for setup + seed)
  */
 import pg from 'pg';
 import { config } from './config.js';
+import { insertMany, truncateAll } from './seed/db.js';
+import { reseed, pick, chance } from './seed/rng.js';
+import * as CAT from './seed/catalog.js';
+import * as W from './seed/tables/workspace.js';
+import * as L from './seed/tables/leads.js';
+import * as CP from './seed/tables/campaign.js';
+import * as P from './seed/tables/portal.js';
+import * as A from './seed/tables/admin.js';
 
-// ---- deterministic PRNG (LCG) so the pool is identical on every seed ------------------
-let _s = 1337;
-const rnd = () => ((_s = (_s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
-const pick = (arr) => arr[Math.floor(rnd() * arr.length)];
-const chance = (p) => rnd() < p;
-const pickSome = (arr, n) => {
-  const pool = [...arr];
-  const out = [];
-  for (let i = 0; i < n && pool.length; i++) out.push(...pool.splice(Math.floor(rnd() * pool.length), 1));
-  return out;
+const counts = {};
+const step = async (client, table, rows) => {
+  const ids = await insertMany(client, table, rows);
+  counts[table] = ids.length;
+  return ids;
 };
 
-const INDUSTRIES = [
-  ...Array(10).fill('Manufacturing'),      // weighted — this is the ICP
-  'Industrial Automation', 'Automotive', 'Aerospace & Defense', 'Pharmaceuticals',
-  'Chemicals', 'Logistics & Supply Chain', 'Energy & Utilities', 'Consumer Goods',
-  'Electronics', 'Food & Beverage', 'Retail', 'Healthcare',
-];
-
-// Apollo-style technographics
-const ERP        = ['SAP', 'SAP S/4HANA', 'Oracle ERP', 'NetSuite', 'Microsoft Dynamics 365', 'Infor'];
-const CLOUD      = ['AWS', 'Microsoft Azure', 'Google Cloud Platform'];
-const DATA       = ['Snowflake', 'Databricks', 'Redshift', 'BigQuery', 'Teradata'];
-const CRM        = ['Salesforce', 'HubSpot', 'Zoho CRM', 'Microsoft Dynamics CRM'];
-// scraper-style technographics
-const SCRAPED_TECH     = ['Kubernetes', 'Docker', 'Kafka', 'Terraform', 'Airflow', 'Spark', 'dbt'];
-const SCRAPED_TOOLS    = ['Jira', 'Confluence', 'ServiceNow', 'Tableau', 'Power BI', 'Looker', 'Workday'];
-const SCRAPED_SERVICES = ['Managed Hosting', 'Systems Integration', 'ERP Implementation',
-                          'Data Migration', 'Cloud Modernization', 'MES Integration'];
-const KEYWORDS = ['digital transformation', 'smart factory', 'industry 4.0', 'predictive maintenance',
-                  'supply chain visibility', 'IIoT', 'lean manufacturing', 'plant automation',
-                  'quality management', 'warehouse automation'];
-
-const PREFIX = ['Vertex', 'Ironclad', 'Northwind', 'Apex', 'Blue Ridge', 'Summit', 'Cascade', 'Meridian',
-  'Granite', 'Copperline', 'Halcyon', 'Redstone', 'Silverpeak', 'Atlas', 'Beacon', 'Crestwood',
-  'Dynamo', 'Everforge', 'Falcon', 'Gearworks', 'Harborline', 'Ridgeline', 'Kestrel', 'Lodestar',
-  'Monarch', 'Nimbus', 'Orbital', 'Pinnacle', 'Quarry', 'Sterling', 'Titan', 'Union'];
-const SUFFIX = ['Industries', 'Manufacturing', 'Works', 'Dynamics', 'Systems', 'Fabrication',
-  'Components', 'Technologies', 'Group', 'Precision', 'Machining', 'Materials'];
-const STATES = [['California','San Jose'],['Texas','Houston'],['Michigan','Detroit'],['Ohio','Cleveland'],
-  ['Illinois','Chicago'],['Pennsylvania','Pittsburgh'],['Georgia','Atlanta'],['Indiana','Indianapolis'],
-  ['Wisconsin','Milwaukee'],['North Carolina','Charlotte'],['Tennessee','Nashville'],['Arizona','Phoenix']];
-const RANGES = [['1-10','8'],['11-50','32'],['51-200','140'],['201-500','380'],
-                ['501-1000','760'],['1001-5000','2400'],['5001-10000','7200'],['10001+','18000']];
-
-const TOTAL = 300;
-const GOLDEN = 12; // Manufacturing + SAP + Snowflake + AWS — the precise ALL-search answer
-
-function makeCompany(i, golden) {
-  const name = `${pick(PREFIX)} ${pick(SUFFIX)}`;
-  const domain = name.toLowerCase().replace(/[^a-z0-9]+/g, '') + '.com';
-  const [state, city] = pick(STATES);
-  const [range, count] = pick(RANGES);
-
-  let technologies = [];
-  if (golden) {
-    technologies = ['SAP', 'Snowflake', 'AWS', ...pickSome(CRM, 1)];
-  } else {
-    if (chance(0.35)) technologies.push(pick(ERP));
-    if (chance(0.55)) technologies.push('AWS');           // AWS is everywhere -> ANY floods
-    if (chance(0.35)) technologies.push(pick(CLOUD));
-    if (chance(0.28)) technologies.push(pick(DATA));
-    if (chance(0.40)) technologies.push(pick(CRM));
-  }
-
-  return {
-    name,
-    domain,
-    website_url: `https://www.${domain}`,
-    industry: golden ? 'Manufacturing' : pick(INDUSTRIES),
-    hq_city: city,
-    hq_state: state,
-    hq_country: 'United States',
-    employee_range: range,
-    employee_count: count,
-    revenue_usd: Math.round((rnd() * 900 + 5) * 100) / 100 * 1_000_000,
-    keywords: pickSome(KEYWORDS, Math.floor(rnd() * 4)),
-    technologies: [...new Set(technologies)],
-    scraped_technologies: chance(0.55) ? pickSome(SCRAPED_TECH, 1 + Math.floor(rnd() * 3)) : [],
-    scraped_tools: chance(0.45) ? pickSome(SCRAPED_TOOLS, 1 + Math.floor(rnd() * 2)) : [],
-    scraped_services: chance(0.35) ? pickSome(SCRAPED_SERVICES, 1 + Math.floor(rnd() * 2)) : [],
-    segments: chance(0.5) ? ['Enterprise'] : ['Mid-Market'],
-    active: true,
-    // NOT NULL in the real table with no default, so the seed must supply them
-    is_target_account: chance(0.2),
-    score: Math.floor(rnd() * 100),
-  };
-}
-
-const rows = [];
-for (let i = 0; i < TOTAL; i++) rows.push(makeCompany(i, i < GOLDEN));
-
-// A deliberate near-miss so substring matching is demonstrable: "SAP" also matches "Sapient".
-rows.push({
-  ...makeCompany(999, false),
-  name: 'Sapient Consulting Group',
-  domain: 'sapientconsulting.com',
-  website_url: 'https://www.sapientconsulting.com',
-  industry: 'Manufacturing',
-  technologies: ['Sapient Cloud Suite', 'AWS', 'Snowflake'], // contains "Sap" but is NOT SAP
-});
-
-const { Client } = pg;
-const client = new Client({ connectionString: config.databaseUrl });
-
-// The table has all 45 real columns; the seed populates the ones a freshly-sourced pool
-// would actually have. The rest (salesperson_*, zoho_account_id, icp_tag, ...) stay NULL,
-// which is also what they look like in the real pool before enrichment/CRM sync.
-const COLS = ['name','domain','website_url','industry','hq_city','hq_state','hq_country',
-  'employee_range','employee_count','revenue_usd','keywords','technologies',
-  'scraped_technologies','scraped_tools','scraped_services','segments','active',
-  'is_target_account','score'];
-
 const run = async () => {
+  const client = new pg.Client({ connectionString: config.databaseUrl });
   await client.connect();
-  await client.query('TRUNCATE lead_company RESTART IDENTITY');
-  for (const r of rows) {
+  reseed(1337);
+
+  const tables = await truncateAll(client);
+  console.log(`truncated ${tables} tables\n`);
+
+  // ---- 1. tenancy & identity ---------------------------------------------------------
+  const tenants = W.buildTenants();
+  const tenantIds = await step(client, 'tenant', tenants);
+
+  const workspaces = W.buildWorkspaces(tenants, tenantIds);
+  const workspaceIds = await step(client, 'workspace', workspaces);
+
+  const users = W.buildUsers(tenants, tenantIds, workspaces, workspaceIds);
+  const userIds = await step(client, 'tenant_user', users);
+  // Give the in-memory rows their real ids — downstream builders filter on them.
+  users.forEach((u, i) => { u.id = userIds[i]; });
+  workspaces.forEach((w, i) => { w.id = workspaceIds[i]; });
+
+  // tenant.owner_id / workspace.owner_id are circular with tenant_user (a tenant's owner is
+  // one of its users), so they're backfilled once the users exist rather than guessed.
+  for (let i = 0; i < tenantIds.length; i++) {
+    const owner = users.find((u) => u.tenant_id === tenantIds[i] && u.roles.includes('TENANT_OWNER'));
+    await client.query('UPDATE tenant SET owner_id = $1 WHERE id = $2', [owner.id, tenantIds[i]]);
+  }
+  for (let i = 0; i < workspaceIds.length; i++) {
+    const ws = workspaces[i];
+    const tenantUsers = users.filter((u) => u.tenant_id === ws.tenant_id);
+    const owner = tenantUsers.find((u) => u.roles.includes('TENANT_OWNER')) ?? tenantUsers[0];
+    const editor = pick(tenantUsers);
     await client.query(
-      `INSERT INTO lead_company (${COLS.join(',')}) VALUES (${COLS.map((_, i) => `$${i + 1}`).join(',')})`,
-      COLS.map((c) => r[c]),
+      'UPDATE workspace SET owner_id = $1, created_by = $2, updated_by = $3 WHERE id = $4',
+      [owner.id, owner.id, chance(0.7) ? editor.id : null, workspaceIds[i]],
     );
   }
-  const { rows: [stat] } = await client.query(`
+
+  await step(client, 'workspace_user', W.buildWorkspaceUsers(users, userIds, workspaces, workspaceIds));
+
+  const mailboxes = W.buildMailboxes(users, userIds, workspaces, workspaceIds);
+  const mailboxIds = await step(client, 'mailbox', mailboxes);
+
+  await step(client, 'refresh_token', W.buildRefreshTokens(users, userIds));
+
+  // ---- 2. territory (timezone_mapping feeds the assignments) -------------------------
+  const timezones = W.buildTimezones();
+  await step(client, 'timezone_mapping', timezones);
+
+  const reps = W.buildTerritoryReps(tenants, tenantIds);
+  const repIds = await step(client, 'territory_rep', reps);
+
+  await step(client, 'territory_state_assignment', W.buildTerritoryAssignments(tenantIds, timezones, reps, repIds));
+
+  // ---- 3. marketplace catalogs -------------------------------------------------------
+  const industries = P.buildIndustries(userIds);
+  const industryIds = await step(client, 'industry', industries);
+
+  const serviceCategories = P.buildServiceCategories(userIds);
+  const serviceCategoryIds = await step(client, 'service_category', serviceCategories);
+
+  const services = P.buildServices(serviceCategoryIds, userIds);
+  const serviceIds = await step(client, 'service', services);
+
+  await step(client, 'industry_service_mapping', P.buildIndustryServiceMappings(industryIds, serviceIds));
+
+  const specCategories = P.buildSpecificationCategories(userIds);
+  const specCategoryIds = await step(client, 'specification_category', specCategories);
+
+  const specifications = P.buildSpecifications(CAT.SPECIFICATION_CATEGORIES, specCategoryIds, userIds);
+  const specificationIds = await step(client, 'specification', specifications);
+
+  await step(client, 'service_specification', P.buildServiceSpecifications(serviceIds, specificationIds));
+
+  const sections = P.buildQuestionSections(userIds);
+  const sectionIds = await step(client, 'question_section', sections);
+
+  const questions = P.buildQuestions(sectionIds, industryIds, userIds);
+  const questionIds = await step(client, 'question', questions);
+
+  // ---- 4. vendors --------------------------------------------------------------------
+  const vendors = P.buildVendors(tenantIds, users, userIds, industryIds, serviceIds, specificationIds, questions, questionIds);
+  const vendorIds = await step(client, 'vendor', vendors);
+
+  await step(client, 'vendor_agreement', P.buildVendorAgreements(vendors, vendorIds));
+
+  const showcases = P.buildVendorShowcases(vendors, vendorIds, serviceIds, userIds);
+  const showcaseIds = await step(client, 'vendor_showcase', showcases);
+
+  const dataPacks = P.buildLeadDataPacks(industryIds, userIds);
+  const dataPackIds = await step(client, 'lead_data_pack', dataPacks);
+
+  await step(client, 'vendor_data_pack', P.buildVendorDataPacks(vendors, vendorIds, dataPackIds, users, userIds));
+
+  // ---- 5. the lead pool (the demo property lives here) --------------------------------
+  const companies = L.buildCompanies(tenantIds, users);
+  const companyIds = await step(client, 'lead_company', companies);
+
+  const jobs = L.buildJobs(companies, companyIds);
+  const jobIds = await step(client, 'lead_company_job', jobs);
+
+  await step(client, 'lead_company_event', L.buildCompanyEvents(companies, companyIds, 500));
+
+  const contacts = L.buildContacts(companies, companyIds, users);
+  const contactIds = await step(client, 'lead_contact', contacts);
+
+  await step(client, 'lead_contact_normalized_title', L.buildNormalizedTitles(contacts, contactIds));
+  await step(client, 'lead_contact_event', L.buildContactEvents(contacts, contactIds, users, workspaces, 500));
+  await step(client, 'lead_company_revision', L.buildCompanyRevisions(companies, companyIds, users, 80));
+  await step(client, 'lead_contact_revision', L.buildContactRevisions(contacts, contactIds, users, 80));
+
+  // ---- 6. tenant-side lead overlays --------------------------------------------------
+  const tenantCompanies = W.buildTenantCompanies(tenants, tenantIds, companies);
+  const tenantCompanyIds = await step(client, 'tenant_company', tenantCompanies);
+
+  const tenantContacts = W.buildTenantContacts(tenants, tenantIds, tenantCompanies, tenantCompanyIds);
+  const tenantContactIds = await step(client, 'tenant_contact', tenantContacts);
+
+  await step(client, 'tenant_contact_metadata', W.buildContactMetadata(contacts, contactIds, reps, repIds, 400));
+  await step(client, 'tenant_lead_filter', W.buildTenantLeadFilters(tenantIds, userIds));
+
+  // ---- 7. imports (tenant_data_source cites the import batch) -------------------------
+  const imports = A.buildImports(tenantIds, users, userIds, 12);
+  const importIds = await step(client, 'lead_file_import', imports);
+
+  await step(client, 'lead_file_import_record', A.buildImportRecords(imports, importIds, companies, companyIds, contacts, contactIds, 240));
+  await step(client, 'tenant_data_source', W.buildDataSources(companies, companyIds, contacts, contactIds, imports, importIds, users, userIds));
+
+  // ---- 8. sourcing requests, quotes, attachments -------------------------------------
+  const rfqs = P.buildRfqs(users, userIds, serviceIds, vendorIds, 30);
+  const rfqIds = await step(client, 'request_for_quote', rfqs);
+
+  const rfps = P.buildRfps(users, userIds, serviceIds, specificationIds, 20);
+  const rfpIds = await step(client, 'request_for_proposal', rfps);
+
+  const quotations = P.buildQuotations(rfqs, rfqIds, rfps, rfpIds, vendors, vendorIds, workspaces, workspaceIds, userIds, 40);
+  const quotationIds = await step(client, 'quotation', quotations);
+
+  await step(client, 'collaborator', P.buildCollaborators(rfqs, rfqIds, rfps, rfpIds, users, userIds));
+
+  // attachment.source_type is the SourceType enum — cover all four values with real ids.
+  const attachmentIds = await step(client, 'attachment', P.buildAttachments([
+    { sourceType: 'REQUEST_FOR_QUOTE', ids: rfqIds, createdAts: rfqs.map((r) => r.created_at) },
+    { sourceType: 'REQUEST_FOR_PROPOSAL', ids: rfpIds, createdAts: rfps.map((r) => r.created_at) },
+    { sourceType: 'QUOTATION', ids: quotationIds, createdAts: quotations.map((q) => q.created_at) },
+    { sourceType: 'SHOWCASE', ids: showcaseIds, createdAts: showcases.map((s) => s.created_at) },
+  ], userIds));
+
+  await step(client, 'attachment_library', P.buildAttachmentLibrary(workspaceIds, userIds));
+
+  // ---- 9. campaigns & outreach -------------------------------------------------------
+  const sequenceTemplates = CP.buildSequenceTemplates();
+  const sequenceTemplateIds = await step(client, 'sequence_template', sequenceTemplates);
+  await step(client, 'email_sequence_template', CP.buildEmailSequenceTemplates(tenants, tenantIds, userIds));
+
+  const campaigns = CP.buildCampaigns(tenants, tenantIds, workspaces, workspaceIds, users, userIds, mailboxes, mailboxIds, companyIds, 20);
+  campaigns.forEach((c, i) => { c.template_id = i % 5 === 0 ? null : pick(sequenceTemplateIds); });
+  const campaignIds = await step(client, 'campaign', campaigns);
+
+  await step(client, 'campaign_email', CP.buildCampaignEmails(campaigns, campaignIds, userIds, attachmentIds));
+
+  const campaignContacts = CP.buildCampaignContacts(campaigns, campaignIds, contacts, contactIds, mailboxes, 500);
+  await step(client, 'campaign_contact', campaignContacts);
+
+  await step(client, 'contact_email', CP.buildContactEmails(campaigns, campaignIds, contacts, contactIds, users, userIds, attachmentIds, 800));
+  await step(client, 'contact_outreach_status', CP.buildOutreachStatuses(campaignContacts, contacts, contactIds, 400));
+  await step(client, 'campaign_chat_memory', CP.buildChatMemories(campaigns, campaignIds, userIds));
+  await step(client, 'message', CP.buildMessages(campaigns, campaignIds, users, userIds, 200));
+
+  // ---- 10. announcements -------------------------------------------------------------
+  const announcements = W.buildAnnouncements(tenants, tenantIds, users, userIds);
+  const announcementIds = await step(client, 'tenant_announcement', announcements);
+
+  await step(client, 'tenant_announcement_contact', W.buildAnnouncementContacts(
+    announcements, announcementIds, contacts, contactIds, tenantContacts, tenantContactIds, users, userIds,
+  ));
+  await step(client, 'email_image', P.buildEmailImages(campaignIds, announcementIds, userIds));
+
+  // ---- 11. apollo + scraper provenance -----------------------------------------------
+  const apolloSpecs = A.buildApolloSpecifications(userIds);
+  const apolloSpecIds = await step(client, 'apollo_specification', apolloSpecs);
+  await step(client, 'apollo_company_search_specification', A.buildApolloCompanySearchSpecifications(userIds));
+  await step(client, 'apollo_company_data', A.buildApolloCompanyData(companies, companyIds, apolloSpecIds, 260));
+  await step(client, 'apollo_contact_data', A.buildApolloContactData(contacts, contactIds, companies, apolloSpecIds, 700));
+  await step(client, 'scrape_job', A.buildScrapeJobs(companies, companyIds, jobs, jobIds, 220));
+
+  // ---- 12. saved lists, notes, search history ----------------------------------------
+  await step(client, 'lead_list', A.buildLeadLists(tenants, tenantIds, workspaces, workspaceIds, users, userIds, companyIds, contactIds));
+  await step(client, 'lead_note', A.buildLeadNotes(companies, companyIds, contacts, contactIds, workspaces, workspaceIds, users, userIds, 220));
+  await step(client, 'lead_query', A.buildLeadQueries(companies, contacts));
+  await step(client, 'lead_search_history', A.buildSearchHistories(users, userIds, 60));
+
+  // ---- 13. admin & audit -------------------------------------------------------------
+  await step(client, 'user_activity_log', W.buildActivityLogs(users, userIds, workspaces, workspaceIds, 300));
+  await step(client, 'feedback', W.buildFeedback(users, userIds, workspaces, workspaceIds, 60));
+  await step(client, 'agreement', W.buildAgreements(userIds));
+  await step(client, 'prompt_specification', CP.buildPromptSpecifications(userIds));
+  await step(client, 'fact', CP.buildFacts());
+
+  // ---- report ------------------------------------------------------------------------
+  await client.query('ANALYZE');
+
+  const names = Object.keys(counts).sort();
+  console.log(`seeded ${names.length} tables:\n`);
+  for (const t of names) console.log(`  ${t.padEnd(42)} ${String(counts[t]).padStart(6)}`);
+
+  const { rows: [demo] } = await client.query(`
     SELECT count(*) AS total,
            count(*) FILTER (WHERE industry = 'Manufacturing') AS manufacturing,
-           count(*) FILTER (WHERE lower(array_to_string(technologies, ',')) LIKE '%sap%') AS sap,
-           count(*) FILTER (WHERE lower(array_to_string(technologies, ',')) LIKE '%aws%') AS aws,
-           count(*) FILTER (WHERE lower(array_to_string(technologies, ',')) LIKE '%snowflake%') AS snowflake
+           count(*) FILTER (
+             WHERE technologies @> ARRAY['SAP','Snowflake','AWS']::varchar[]
+               AND industry = 'Manufacturing'
+           ) AS all_sap_snow_aws,
+           count(*) FILTER (
+             WHERE technologies && ARRAY['SAP','Snowflake','AWS']::varchar[]
+           ) AS any_sap_snow_aws,
+           count(*) FILTER (
+             WHERE lower(array_to_string(technologies, ',')) LIKE '%sap%'
+           ) AS substring_sap
       FROM lead_company`);
-  console.log('seeded lead_company:', stat);
+  console.log('\nsearch demo property:');
+  console.log(`  lead_company total .......................... ${demo.total}`);
+  console.log(`  industry = Manufacturing .................... ${demo.manufacturing}`);
+  console.log(`  ALL(SAP + Snowflake + AWS) + Manufacturing .. ${demo.all_sap_snow_aws}`);
+  console.log(`  ANY(SAP | Snowflake | AWS) .................. ${demo.any_sap_snow_aws}`);
+  console.log(`  substring '%sap%' (incl. the Sapient near-miss) ${demo.substring_sap}`);
+
   await client.end();
 };
 
-run().catch((e) => { console.error(e); process.exit(1); });
+run().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

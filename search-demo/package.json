@@ -8,6 +8,7 @@
   "scripts": {
     "setup": "node setup.js",
     "seed": "node seed.js",
+    "verify": "node verify.js",
     "reset": "npm run setup && npm run seed"
   },
   "dependencies": {
