@@ -1,0 +1,17 @@
+{
+  "name": "leadplus-search-demo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone search demo — database schema + synthetic lead pool. Real leadplus_dev data to be swapped in later.",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "setup": "node setup.js",
+    "seed": "node seed.js",
+    "reset": "npm run setup && npm run seed"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "pg": "^8.12.0"
+  }
+}
