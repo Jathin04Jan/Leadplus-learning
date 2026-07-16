@@ -126,14 +126,62 @@ LeadCompanyMapper, plan-tier feature gating + territory/org-chart, keyword match
 assistant chat, reply-intent classification, and the full frontend (incl. the search-filter
 refactor). Backend green on `./gradlew test` (551 tests) + the full-context boot smoke; frontend
 green on `npm run typecheck` + `npm run build`. Unlike PRs #41/#42, boundaries + build gates were
-enforced per stage. Follow-ups / debt introduced:
+enforced per stage.
+
+**Follow-up verification pass (later session).** A deep completeness re-audit of the wave against the
+Limark PR-#46 reference found — beyond the four documented debt items — three **silent correctness
+regressions** the surface-green gates had missed (the remodel shipped the delete/revision WRITE path
+but dropped the matching READ-path visibility). All items below are now resolved on the branch; verified
+with `./gradlew test` (560 tests, 0 failures, incl. `ModuleBoundariesTest`), the full-context boot smoke,
+a fresh `schema.sql` apply + the data-migration script on real PostgreSQL 16, and a new
+Postgres-backed `LeadVisibilityIntegrationTest` (exclusion/shadow scenarios) + `CampaignMembershipGuardTest`.
 
 | # | Item | Sev | Status | Where / notes |
 |---|------|-----|--------|---------------|
-| W1 | **Import keyword/tech merge dropped** — `TenantContactImportService` was adapted onto the Admin/Workspace facades but Limark's company keyword/technology merge on import was intentionally omitted to keep the facade port minimal. Verify significance and restore if needed. | 🟡 | 🔵 | `leadgen/search/service/TenantContactImportService.java` |
-| W2 | **Campaign active-membership logic un-unit-tested** — `CampaignMembershipGuard`'s status matrix moved into `CampaignModule.hasActiveCampaignMembership` (RUNNING/PAUSED block, cross-tenant allow); the guard test now mocks the facade, so that specific status filtering has no dedicated unit test. | 🟡 | 🔵 | `leadgen/campaign/CampaignModule.java` — add a focused test. |
-| W3 | **New tables show as "unowned" in SCHEMA.md** — the schema-md generator's table→module heuristic doesn't map the 5 new tables (apollo_company_search_specification, lead_company/contact_revision, territory_rep/state_assignment). Cosmetic; entities ARE module-owned. | 🟡 | 🔵 | `scripts/generate-schema-md.py` ownership map. |
-| W4 | **Apollo lead contact/company endpoints re-pathed + admin-gated** — mirrors the Limark source (now `/v1/admin/companies`, `/v1/admin/contacts`); a behavioral change vs the prior Corelabs paths, no test coverage on the path change. Confirm no other caller depended on the old paths. | 🟡 | 🔵 | `leadgen/search/controller/ApolloLead*Controller.java` |
+| W1 | **Import keyword/tech merge dropped** — Limark's company keyword/technology union-on-import was omitted during the facade port (incl. the AI column-mapper dropping the two columns), silently disabling enrichment-on-import. | 🟠 | 🟢 | **FIXED** — restored `mergeKeywords/TechnologiesIfPresent` + union helpers in `leadgen/search/service/TenantContactImportService.java`, and re-added `companyKeywords`/`companyTechnologies` to `AiColumnMapperService` `KNOWN_FIELDS`. |
+| W2 | **Campaign active-membership logic un-unit-tested** — the RUNNING/PAUSED-block + cross-tenant-allow status matrix in `CampaignModule.hasActiveCampaignMembership` had no dedicated test. | 🟡 | 🟢 | **FIXED** — added `CampaignMembershipGuardTest` (7 cases: empty, no-membership, RUNNING, PAUSED, COMPLETED, DRAFT, cross-tenant). |
+| W3 | **New tables show as "unowned" in SCHEMA.md** — generator ownership map missed the 5 new tables. | 🟡 | 🟢 | **FIXED** — mapped all 5 (+ a stray pre-existing `tenant_data_source`) in `scripts/generate-schema-md.py`; regenerated SCHEMA.md → `unowned=[]`. |
+| W4 | **Apollo lead endpoints re-pathed + admin-gated** — flagged as an untested path change. | 🟡 | 🟢 | **RESOLVED (non-issue)** — verified the Limark source already used `/v1/admin/companies` + `/v1/admin/contacts` with `hasRole('ADMIN')`; the migration mirrored them. No old path existed; no FE/API caller depends on any changed path. |
+| W5 | **Exclusion/shadow lead-search visibility DROPPED (HIGH)** — the remodel replaced the legacy copy-on-write visibility predicate (`(tenantId=X AND exclusion=false) OR (tenantId IS NULL AND NOT EXISTS <tenant copy>)`, plus deleted-company-hides-contacts cascade) with a naive `tenantId IS NULL OR =X` across `ContactLeadSearchService`, `CompanyLeadSearchService` (+ its helper), `TenantLeadService`, and `AgentLeadCountAggregationService`. Since `deleteContact/Company` set `exclusion=true` (leaving `active=true`) and search filtered only `active=true`, **deleted leads stayed visible and shared records weren't shadowed** — the whole delete feature was invisible end-to-end. | 🔴 | 🟢 | **FIXED** — ported the legacy exclusion-shadow predicates (facade calls + id-based subqueries preserved) into all four services; re-threaded the dropped `parentQuery`/`tenantId` params. Proven by `LeadVisibilityIntegrationTest` on real Postgres. Commit `6f3f4af`. |
+| W6 | **Lead unique constraints + hot-path indexes DROPPED (HIGH)** — migrated `schema.sql` lost `uq_lead_company_domain_tenant` / `uq_lead_contact_email_tenant` (`UNIQUE NULLS NOT DISTINCT`) and 9 `idx_lead_*` indexes that legacy PR-#46 added for the remodel. The unique constraints are load-bearing for the copy-on-write race-safety (`addContactOrReuseExisting` catches `DataIntegrityViolationException`) and the single-shared-record invariant. | 🟠 | 🟢 | **FIXED** — restored the 2 constraints + 9 indexes in `schema.sql` and (guarded) in `scripts/migrate-lead-pool-tenant-id.sql`; verified on fresh PostgreSQL 16 + idempotent migration re-run. |
+| W7 | **`DataPackGate.buildGatePredicates` diverged from its own `isAccessible` (MED)** — the remodel rewrote the SQL gate builder so it ANDed the segment gate across all rows and dropped legacy Arm 3 + the tenant-copy-always-visible arm, no longer matching the (identical-to-legacy) in-memory `isAccessible`. Could hide a vendor's own tenant copies / legitimately-accessible gated records. | 🟡 | 🟢 | **FIXED** — restored the legacy `buildGatePredicates` (tenant Arm A OR segment-confined-to-platform Arm B) in `shared/admin/service/DataPackGate.java`, realigning it with `isAccessible`. |
+| W8 | **Stale `lead-chat-assistant.md` prompt (MED)** — the AI lead-assistant prompt dropped the keyword-match-mode extraction rules, so the Stage-5 AND/OR feature was unreachable via the assistant (backend honored it; the LLM never emitted `keywordMatchMode`). | 🟡 | 🟢 | **FIXED** — added the `keywordMatchMode` extraction rules to the migrated prompt (kept the unsupported `excludedKeywords` rules out, since that field doesn't exist in migrated `LeadFilterCriteria`). |
+
+## 9. Limark → Corelabs completeness audit (post-merge of PR #47, 2026-07-16)
+
+A full layer-by-layer comparison of the frozen `Limark/` legacy app against the active
+`Leadplus-corelabs/` modular app, run **after** the wave-2 migration merged to `main` (`5d93540`).
+
+**Verified complete (no gaps):**
+
+| Layer | Limark | Corelabs | Result |
+|-------|--------|----------|--------|
+| DB tables (`schema.sql`) | 70 | 70 | exact match |
+| JPA entities | 70 | 70 | exact match |
+| Repositories | 70 | 70 | exact match |
+| Services | 133 | 134 | none missing |
+| Controllers | 88 | 89 | reconcile (2 renames) |
+| Endpoints (`@*Mapping`) | 369 | 368 | 1 gap → G1 |
+| AI prompts | 9 | 9 | exact match |
+| Frontend `.ts(x)` files | 656 | 660 | **0 missing** |
+| All Java classes | 1023 | 1034 | 15 Limark-only → 13 benign, 2 real (G2) |
+
+The 15 Limark-only classes classified: 3 renames (`AdminApolloLead{Company,Contact}Controller`
+→ `ApolloLead*Controller`; `MailboxServiceScheduler` → `MailboxRuntimeScheduler`;
+`CampaignEmailRepliedEvent` → `ReplyReceivedEvent`), 1 deliberate deviation
+(`ReplyClassificationRequestedEvent` — reuses tracking's `ReplyReceivedEvent`), **7 dead events**
+(`UserCreatedEvent`, `Fact{Created,Update,Delete}Event`, `Collaborator{Created,Update,Delete}Event`
+— verified **0** `@EventListener`s in Limark), 1 event correctly replaced by direct facade calls
+(`VendorApprovedEvent` → `WorkspaceModule.enableVendorModules` + `sendVendorApprovedEmail`,
+behaviour verified equivalent), and 2 real gaps (G2).
+
+**Gaps found:**
+
+| # | Item | Sev | Status | Where / notes |
+|---|------|-----|--------|---------------|
+| G1 | **Campaign delete endpoint missing — the UI button 404s.** The portal (`CampaignTableActions` → `useDeleteCampaign` → `deleteCampaign`) calls `DELETE /v1/tenants/{t}/workspaces/{w}/campaigns/{id}`, but `CampaignController` had **no `@DeleteMapping`**. `CampaignService.deleteCampaignById()` (draft-only, publishes `CampaignDeletedEvent`) and the event both exist — only the endpoint was never migrated. **Pre-existing:** verified absent at `4790c9d`, i.e. from the *original* modular refactor, not from wave-1/wave-2. Same defect class as M7 (frontend wired to a non-existent endpoint). | 🟠 | 🟢 | Fixed on `jathin/fix-campaign-delete-endpoint` — added the endpoint mirroring the sibling pause/resume pattern. |
+| G2 | **System-email templating never migrated** — Limark's `application/email/SystemEmailTemplate` (enum: reset-password, workspace-invitation, otp-verify, collaborator-invite, …) + `SystemEmailTemplateRenderer` (`TEMPLATE_DIR = "email-templates/"`) and the **11** `resources/email-templates/*.html` files have no Corelabs counterpart. Corelabs still uses the older **AWS SES server-side** templates (`EmailService` → `OutreachModule.sendTemplatedEmail` → `AwsSESClient.sendTemplatedEmail` + `EmailTemplateConfiguration`). Added in Limark commit `986a82e` — the **wave-1** feature commit — so **PRs #41/#42 missed it**. Not broken (both paths send mail), but a divergence: those emails depend on templates provisioned in SES rather than living in the repo. | 🟠 | 🔵 | Decide: migrate Limark's local renderer, or keep SES templates and drop the Limark path. Note `EmailService.safeSend` swallows failures (best-effort), so a missing SES template fails **silently**. |
+| G3 | **`leadplus-intelligence-service` is entirely un-migrated** — a whole Node/TypeScript + MongoDB "LeadPlus Intelligence Layer" service in `Limark/` (25 TS files; own API routes/controllers/middleware, repositories for account/contact/source, Dockerfile, CI) with **no counterpart** in `Leadplus-corelabs/`. Self-described as a "clean, deployable backend foundation" (scaffolding). Probably intentional — separate deployable, Mongo-based, and it overlaps the Java-now/Python-later intelligence plan — but the exclusion has never been an explicit, recorded scope decision. | 🟡 | ⚪ | `Limark/leadplus-intelligence-service/`. Needs a scope ruling in `Docs/SCOPE-DECISIONS.md`: migrate, keep as a separate repo/service, or retire. |
 
 ## How to append
 When we find something new while going through the course:
