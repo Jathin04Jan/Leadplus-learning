@@ -204,18 +204,35 @@ def profile_lead_query_types(conn: psycopg.Connection) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
+# Test fixtures seeded into leadplus_dev on 2026-07-09. `.example` is reserved by RFC 2606 and
+# can never resolve, so this predicate cannot exclude a real company — that is the whole reason
+# the TLD exists.
+#
+# They are excluded because they OUTRANK the real pool, not because they are untidy. Measured
+# before this filter existed: 25 rows, 0.11% of 23,063 companies, taking 9-10 of every top 10.
+# "companies hiring for ERP migration" returned four `Synthetic ...` shops with an identical
+# 'ERP Transformation Program Manager' posting and ZERO real companies. They win because they
+# were built to: 12 carry SAP+Snowflake+AWS exactly, a combination NO real company in the pool
+# has. Ranking fictions above real leads is the failure this project exists to end, so they are
+# cut at the fold — the root — and nothing downstream can index them.
+FIXTURE_PREDICATE = "domain NOT LIKE '%%.example'"
+
+
 def fetch_companies_for_fold(conn: psycopg.Connection) -> list[dict[str, Any]]:
-    """All active companies with the fields the fold needs.
+    """All active, real companies with the fields the fold needs.
 
     Deliberately NOT filtered on `exclusion`: exclusion is a per-tenant list-hygiene flag, not a
     statement that the company is unreal. Dropping those rows here would silently shrink the
     canonical set and desync `job_signal.company_id` for their jobs.
+
+    Test fixtures ARE filtered — see `FIXTURE_PREDICATE`. A company that never becomes canonical
+    cannot be indexed, so this one predicate keeps them out of every downstream table.
     """
     return conn.execute(
-        """
+        f"""
         SELECT id, lower(trim(domain)) AS domain_key, domain, tenant_id, name
         FROM lead_company
-        WHERE active
+        WHERE active AND {FIXTURE_PREDICATE}
         ORDER BY id
         """
     ).fetchall()
