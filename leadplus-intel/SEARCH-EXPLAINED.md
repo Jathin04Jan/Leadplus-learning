@@ -48,9 +48,9 @@ problem is docs that drift from code (five instances are logged as X1–X5 in `.
 | Canonical technology vocabulary | ✅ **live** | 4,511 terms, invariant enforced |
 | Location aliasing | ✅ **live** | 4,285 aliases |
 | Determinism (same query → same ranking) | ✅ **live** | byte-identical sha256 across runs |
-| **Full company index (22,941)** | 🔄 **in progress** | was 462 (2%); indexing now |
-| **`industry_alias` expansion** | 🔄 **in progress** | §6.2 |
-| **`segments` remap to the real vocabulary** | 🔄 **in progress** | §6.3 |
+| **Full company index (22,876)** | ✅ **live** | was 462 (2%); now every canonical company |
+| **`industry_alias` expansion** | ✅ **live** | 145 aliases → 95 taxonomy values; §6.2 |
+| **`segments` remap to the real vocabulary** | ✅ **live** | off the Enterprise/Mid-Market fiction; §6.3 |
 | **Contact index (`contact_signal`)** | ✅ **live** | 53,746 role rows, no PII columns; §9 |
 | **Zero-explainer** | ✅ **live** | limiter analysis + relax suggestion; §10 |
 
@@ -569,7 +569,7 @@ changes them, not a silent mismatch. Point it at a different source and nothing 
 |---|---|
 | **Adversarial (4)** | **4/4 pass** — injection refused, empty string refused, SQL refused, impossible-AND refused. No crash, no leak. |
 | Boolean / negation | logic verified live — S/4HANA, Oracle, New York all excluded with zero leaks |
-| Structural | blocked on the full index (in progress) |
+| Structural | ✅ works on the full 22,876-company index (location/size/industry/NAICS/LinkedIn) |
 | Tech stack | real data exists — SAP ECC **16**, SAP+AWS/Azure **149**, Salesforce+Zoho **20**, Snowflake+AWS **64** |
 | Intent | works — *"companies hiring for ERP migration"* → **Jillamy Inc.**, `Systems Engineer – WMS/ERP`, *"modernizing its warehouse management"* |
 | Contacts (2) | **pass** (§9) — *"CFOs or VPs of Finance in retail"* → retail companies each with a finance VP/CFO role as evidence; *"Big-4 alumnus recently landed"* → 8 companies, ex-Deloitte/KPMG/PwC/EY roles with landing dates. No names in either. |
