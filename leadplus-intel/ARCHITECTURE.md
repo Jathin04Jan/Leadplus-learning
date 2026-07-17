@@ -96,10 +96,19 @@ Real dated postings do exist (22 active, 62 total) — but **not one of them car
 over 200 chars**, so not one is extractable. So every non-NULL `job_signal.posted_date` in this
 index belongs to a company that does not exist.
 
-The consequence is a silent, confident lie: **any query with `since_days` can only return
-synthetic companies**, because they are the only rows that can pass a date filter. "Manufacturers
-hiring for SAP in the last quarter" returns a ranked list of fictions, with evidence and
-paraphrases, at high confidence. That is precisely the failure mode this project exists to end.
+> **UPDATE — this was fixed after this section was written.** The `.example` fixtures are now
+> excluded from the index at the company fold (`FIXTURE_PREDICATE` in `repository.py`). Verified
+> against the live DB: **0** `.example` companies in `company_signal`, and **0 of 2,761** indexed
+> `job_signal` rows carry a `posted_date`. So a `since_days` query no longer returns fictions — it
+> returns **nothing**, and the zero-explainer (§10) says why ("no indexed posting carries a date").
+> The finding below stands (the recency axis is dead); only the *symptom* changed from "returns
+> fictions" to "honestly returns zero".
+
+The consequence, before the fix, was a silent, confident lie: any query with `since_days` could
+only return synthetic companies, because they were the only rows that could pass a date filter.
+"Manufacturers hiring for SAP in the last quarter" returned a ranked list of fictions, with
+evidence and paraphrases, at high confidence. That is precisely the failure mode this project
+exists to end — and it is now closed at the fold.
 
 It also means the **thesis is currently unprovable on this data**. §0's wedge is *"a company
 posting this six days ago is actively investing"* — recency of hiring signal. Zero real postings
@@ -110,12 +119,12 @@ finding: the scraper has never once captured a date on a posting it also capture
 **2. The other team's `lead_company_job_intent` describes ONLY these 25 fictions.**
 All 451 rows, all 92 jobs, all 25 companies — every one `.example`. See §5.8.
 
-**Neither is patched here.** The 2,886 are ingested as briefed, synthetic rows included, because
-the honest move is to surface this rather than quietly drop rows and report a clean number. They
-are trivially identifiable (`lead_company.domain LIKE '%.example'` / `tenant_id = 29`), so
-excluding them is a one-line predicate in `fetch_jobs_to_normalize` — but whether demo data
-belongs in `leadplus_dev` at all is a decision for whoever put it there, not a thing to paper
-over in a derived index.
+**These WERE surfaced first, then excluded.** The 2,886 were initially ingested with the synthetic
+rows included — the honest move being to surface the problem rather than quietly drop rows and
+report a clean number. Once surfaced (they took 9–10 of every top 10, ranking fictions above real
+leads), they were excluded via the one-line `FIXTURE_PREDICATE` (`domain LIKE '%.example'`) at the
+company fold, so nothing downstream can index them. Whether demo data belongs in `leadplus_dev` at
+all remains a decision for whoever put it there — but it no longer contaminates this derived index.
 
 This build proves the architecture and the three defects are fixed. Whether job-intent is a
 *product* is now answerable on real data for the first time — but not from this document.
