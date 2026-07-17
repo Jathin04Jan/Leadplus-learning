@@ -523,15 +523,34 @@ def _fuse(
     qvec: Sequence[float],
     filters: dict[str, Any],
 ) -> tuple[dict[int, float], dict[int, float], dict[int, int], dict[str, int]]:
-    """§6[3]-[4] — the four lists and their fusion, for one set of filters."""
-    # Four lists, top 200 each. The two job lists share one filtered survivor set; the two
-    # company lists share the other (no date filter — companies have no posted_date, §6[3b]).
+    """§6[3]-[4] — the retrieval lists and their fusion, for one set of filters.
+
+    SIX lists now, not four. The two added ones retrieve over `job_intent` — the finer grain
+    adopted from the other team — and they are fused by the SAME company-level RRF as the rest
+    (§8.1), which is the whole reason adding a source is cheap here: RRF takes ranks, so a new
+    scorer needs no re-weighting, no normalisation and no tuning to join. It contributes
+    1/(60+rank) like everything else.
+
+    They are a genuinely different signal, not a duplicate of `job_signal`: a paraphrase and its
+    intents are two readings of one posting, and a query phrased as an initiative ("erp
+    transformation program") hits the intent index precisely while hitting the paraphrase only
+    diffusely. A company found by both rises — which is exactly what §5.1 says two document types
+    are for, applied at a finer grain.
+    """
+    # The job-side lists share one filtered survivor set; the company lists share the other
+    # (no date filter — companies have no posted_date, §6[3b]).
     job_lex = (
         repository.search_jobs_lexical(conn, phrases=phrases, filters=filters, limit=LIST_DEPTH)
         if phrases
         else []
     )
     job_sem = repository.search_jobs_semantic(conn, qvec=qvec, filters=filters, limit=LIST_DEPTH)
+    int_lex = (
+        repository.search_job_intents_lexical(conn, phrases=phrases, filters=filters, limit=LIST_DEPTH)
+        if phrases
+        else []
+    )
+    int_sem = repository.search_job_intents_semantic(conn, qvec=qvec, filters=filters, limit=LIST_DEPTH)
     com_lex = (
         repository.search_companies_lexical(conn, phrases=phrases, filters=filters, limit=LIST_DEPTH)
         if phrases
@@ -540,7 +559,7 @@ def _fuse(
     com_sem = repository.search_companies_semantic(conn, qvec=qvec, filters=filters, limit=LIST_DEPTH)
 
     job_to_company: dict[int, int] = {}
-    for row in (*job_lex, *job_sem):
+    for row in (*job_lex, *job_sem, *int_lex, *int_sem):
         job_to_company[row["job_id"]] = row["company_id"]
 
     # [4] Project jobs -> companies FIRST, then fuse. Fusing at job level and grouping afterwards
@@ -550,11 +569,15 @@ def _fuse(
     l2 = to_company_ranks(_ranks(job_sem, "job_id"), job_to_company)
     l3 = _ranks(com_lex, "company_id")
     l4 = _ranks(com_sem, "company_id")
+    l5 = to_company_ranks(_ranks(int_lex, "job_id"), job_to_company)
+    l6 = to_company_ranks(_ranks(int_sem, "job_id"), job_to_company)
 
-    fused = rrf(l1, l2, l3, l4)
+    fused = rrf(l1, l2, l3, l4, l5, l6)
     sizes = {
         "job_lexical": len(job_lex),
         "job_semantic": len(job_sem),
+        "intent_lexical": len(int_lex),
+        "intent_semantic": len(int_sem),
         "company_lexical": len(com_lex),
         "company_semantic": len(com_sem),
         "candidates": len(fused),

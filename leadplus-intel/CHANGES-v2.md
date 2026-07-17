@@ -252,6 +252,24 @@ return companies. **Filter on facts, rank on fuzz** — §2.1/§3/§4/§5 *sharp
 break it: negation, location, segments and NULL checks are facts; `industry` stays fuzzy and soft
 unless the user says "strictly".
 
-**Still true:** every weight in §8.2/§8.5 is untuned, `golden.yaml` is machine-authored, and the
+**Still true:** every weight in §8.2/§8.5 is untuned. ~~`golden.yaml` is machine-authored, and the
 corpus is synthetic. None of this is validated until the `GRANT` lands and the real job postings are
-in the index.
+in the index.~~
+
+> **UPDATE — the real job postings are now in the index, and that sentence needs three
+> corrections.** See `ARCHITECTURE.md` §0.
+>
+> * **The corpus is real.** A 1:1 clone of `leadplus_dev` replaced the synthetic seed. The `GRANT`
+>   is no longer the blocker.
+> * **`golden.yaml` is not merely machine-authored, it is DEAD.** Its labels are synthetic company
+>   ids that now resolve to unrelated real companies. `scripts/eval.py` refuses to score it.
+> * **"Validated once the real postings land" did not happen, and it is worth being precise about
+>   why.** The postings landed and the v2 *behaviours* hold (refusal, determinism, canonical-only
+>   negation — see `scripts/acceptance.py`). But **ranking quality is still unmeasured**, because
+>   the labels died with the seed; and the §0 thesis is worse off than unmeasured — it is
+>   currently **unprovable**, since every `posted_date` in the extractable corpus belongs to a
+>   fabricated company and `recency` is 0.0 for every real one.
+>
+> The lesson §8 already stated, now with a second example: the seed blocked four questions and
+> that was the seed telling you it was not representative. The real corpus is now telling you
+> something else — that the field the thesis leans on hardest was never captured.

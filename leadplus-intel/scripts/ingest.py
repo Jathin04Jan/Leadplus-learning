@@ -30,7 +30,13 @@ import time
 import _bootstrap  # noqa: F401
 
 from intel import canonicalize, config, embed, llm, normalize, repository
-from intel.models import CompanySignalRow, CompanySource, JobSignalRow, JobSource
+from intel.models import (
+    CompanySignalRow,
+    CompanySource,
+    JobIntentRow,
+    JobSignalRow,
+    JobSource,
+)
 
 
 class Stats:
@@ -38,9 +44,11 @@ class Stats:
         self.seen = 0
         self.written = 0
         self.failed = 0
+        self.intents = 0
 
     def __str__(self) -> str:
-        return f"seen={self.seen} written={self.written} failed={self.failed}"
+        base = f"seen={self.seen} written={self.written} failed={self.failed}"
+        return f"{base} intents={self.intents}" if self.intents else base
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +60,7 @@ def show_job(job: JobSource, record) -> None:
     print(f"\n{'=' * 100}")
     print(f"job {job.id} · {job.title} · {job.department or '-'} · {job.type or '-'}")
     print(f"  company industry : {job.industry or '-'}   scraper tech: {job.technologies or []}")
+    print(f"  desc {len(job.description or '')} chars   posted={job.posted_date.date() if job.posted_date else 'NULL'}")
     print(
         f"  ENUMS  initiative={record.initiative.value}  function={record.function.value}  "
         f"seniority={record.seniority.value}  engagement={record.engagement_type.value}  "
@@ -59,6 +68,13 @@ def show_job(job: JobSource, record) -> None:
     )
     print(f"  TECH   {record.technologies}")
     print("  PARA   " + textwrap.fill(record.paraphrase, 94, subsequent_indent="         "))
+    # The 25-row gate reads these. The intents are the grain adopted from the other team, and
+    # the failure they are most likely to show — templating from the title instead of reading
+    # the description — is only visible by eye, across several rows of the same title.
+    for intent in record.intents:
+        print(f"  INTENT · {intent}")
+    if not record.intents:
+        print("  INTENT · (none — the posting named no work)")
 
 
 def show_company(company: CompanySource, record) -> None:
@@ -135,20 +151,37 @@ async def ingest_jobs(conn, *, limit: int | None, dry_run: bool, show: bool) -> 
             continue
 
         # Stage 3 — canonicalise technologies (no-op until tech_canonical is seeded).
+        #
+        # Technologies ONLY. Intents are NOT canonicalised (§5.8): a product has an official name
+        # to snap to and a descriptive phrase does not. The ladder was applied to intents once and
+        # measured — 5,209 distinct phrases in 8,114 rows, 3.9% resolved, nearest cosines
+        # 0.32-0.52 — then removed. Intents go to `job_intent` as extracted, and match on their
+        # embedding. `all_intents` below is gathered for EMBEDDING, not for resolution.
         tech_lists = []
         for _job, record in good:
             tech_lists.append(
                 await tech.canonical_list(list(record.technologies)) if tech else list(record.technologies)
             )
 
-        # Stage 4 — embed the PARAPHRASE only, batched 100 (§5.2 stage 4).
-        vectors = await embed.embed_texts([r.paraphrase for _j, r in good])
+        all_intents = sorted({i.strip().lower() for _j, r in good for i in r.intents if i.strip()})
 
-        for (job, record), techs, vector in zip(good, tech_lists, vectors):
+        # Stage 4 — embed the PARAPHRASE and each INTENT. Never the raw description.
+        #
+        # One flat batch for both: the embeddings endpoint takes 100 inputs per call, and an
+        # intent phrase is ~5 tokens, so folding them in here costs a rounding error rather than
+        # a second pass. The paraphrases come first so the split below is a slice, not a lookup.
+        texts = [r.paraphrase for _j, r in good] + all_intents
+        vectors = await embed.embed_texts(texts)
+        para_vectors = vectors[: len(good)]
+        intent_vectors = dict(zip(all_intents, vectors[len(good) :]))
+
+        intent_rows: list[JobIntentRow] = []
+        for (job, record), techs, vector in zip(good, tech_lists, para_vectors):
+            company_id = canonical.get(job.lead_company_id, job.lead_company_id)
             rows.append(
                 JobSignalRow(
                     job_id=job.id,
-                    company_id=canonical.get(job.lead_company_id, job.lead_company_id),
+                    company_id=company_id,
                     initiative=record.initiative.value,
                     function=record.function.value,
                     seniority=record.seniority.value,
@@ -163,16 +196,53 @@ async def ingest_jobs(conn, *, limit: int | None, dry_run: bool, show: bool) -> 
                     model=model,
                 )
             )
+            # One job_intent row per phrase — their grain, plus our provenance. Deduped within
+            # the job: the unique index would reject a repeat, and a repeat is a model slip, not
+            # a reason to fail the row.
+            seen: set[str] = set()
+            for raw in record.intents:
+                phrase = raw.strip().lower()
+                if not phrase or phrase in seen:
+                    continue
+                seen.add(phrase)
+                intent_rows.append(
+                    JobIntentRow(
+                        job_id=job.id,
+                        company_id=company_id,
+                        intent=phrase,
+                        # The phrase as extracted, plus its vector. There is no canonical claim to
+                        # make about it and we do not invent one (§5.8) — the embedding is how it
+                        # is matched.
+                        intent_embedding=intent_vectors.get(phrase),
+                        prompt_version=prompt_version,
+                        model=model,
+                    )
+                )
 
         missing = [r.job_id for r in rows if r.company_id not in canonical_ids]
         if missing:
             raise RuntimeError(f"§5.4 invariant broken: non-canonical company_id for jobs {missing}")
 
-        # Stage 5 — single upsert keyed on job_id: a crash mid-batch leaves no partial rows.
+        # Stage 5 — load. A crash mid-batch leaves no partial rows (§5.2 stage 5).
         if dry_run:
             stats.written += len(rows)
+            stats.intents += len(intent_rows)
         else:
-            stats.written += repository.upsert_job_signals(conn, rows)
+            # ONE transaction across both tables, and it has to be: resumability keys on
+            # job_signal (§5.2's NOT EXISTS), so a job_signal row committed without its
+            # job_intent rows would be skipped forever on the next run — permanently
+            # intent-less, and invisibly so. The two writes are one fact about one job; the
+            # inner transactions become savepoints.
+            with conn.transaction():
+                stats.written += repository.upsert_job_signals(conn, rows)
+                # job_keys is every job in the batch, including those that produced no intents:
+                # "this posting names no work" is a result, and it has to be able to erase a
+                # previous run's phrases. See replace_job_intents.
+                stats.intents += repository.replace_job_intents(
+                    conn,
+                    intent_rows,
+                    job_keys=[(r.job_id, prompt_version, model) for r in rows],
+                )
             repository.clear_dead_letters(
                 conn,
                 kind="job",
@@ -324,8 +394,16 @@ async def run(args: argparse.Namespace) -> int:
             counts = repository.verify_counts(conn)
             print(
                 f"\nstored: job_signal={counts['job_signal']} "
+                f"job_intent={counts['job_intent']} "
                 f"company_signal={counts['company_signal']} "
                 f"dead_letters={counts['dead_letters']}"
+            )
+            print(
+                f"        embeddings: job={counts['job_dims']}d "
+                f"company={counts['company_dims']}d intent={counts['intent_dims']}d · "
+                f"null: job={counts['job_signal_no_embedding']} "
+                f"company={counts['company_signal_no_embedding']} "
+                f"intent={counts['job_intent_no_embedding']}"
             )
             if counts["dead_letters"]:
                 print("  dead-lettered rows:")

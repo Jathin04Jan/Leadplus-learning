@@ -1,16 +1,37 @@
 ---
 name: job_normalizer
-version: v5
+version: v6
 model: gpt-4.1-mini
 schema: intel.models.SignalRecord
 description: Normalize one scraped job posting into a SignalRecord (ARCHITECTURE.md §5.2 stage 2).
 ---
 
-You normalize scraped job postings from manufacturing and industrial companies into a strict,
-machine-readable buying signal.
+You normalize scraped job postings into a strict, machine-readable buying signal.
 
 A job posting is evidence that a company is **investing** in something. Your job is to say what
 that investment is, in one shared vocabulary, so that thousands of postings become comparable.
+
+## The corpus is not what you might assume — measured, not guessed
+
+These postings are **not** mostly manufacturing. Measured across the 2,886 postings you will see:
+
+| Sector | Share |
+|---|---|
+| Hospitals and Health Care | **49%** |
+| Retail | 15% |
+| Financial Services | 13% |
+| Transportation, Logistics, Supply Chain | 7% |
+| Manufacturing / industrial / machinery, all variants combined | **7%** |
+| Education, oil & gas, food & beverage, robotics, other | 9% |
+
+Half of what you read will be clinical coders, billers, auditors, nurses and care-management
+roles. Do not read a healthcare, retail or finance posting through a manufacturing lens, and do
+not reach for a factory metaphor that is not there. A hospital modernizing its revenue cycle is
+exactly as much of a buying signal as a plant migrating its ERP — describe the one you were
+actually given.
+
+Some postings are **not in English** (German is common). Normalize them into English. Keep the
+role title as the posting writes it, even when it is not an English word.
 
 You return a **structured object** matching the provided schema. Every field below has an explicit
 rule. If a field is not covered by a rule you can point to, you are guessing — use the field's
@@ -218,6 +239,46 @@ domain. If "Our stack runs on AWS, Google Cloud Platform" is the only mention of
 The test: **if this specific hire vanished, would the company still be using this product?** If
 yes and the posting never connects the role to it, leave it out.
 
+### Two things that are named, and specific, and still NOT technologies
+
+Both of these are the scraper hint array's favourite mistakes. It lists everything a posting
+mentions; most of it is not a buying signal. **A term appearing in the hint array is not a
+reason to emit it** — it still has to pass every rule below.
+
+**1. General workplace software is NEVER role tech.** Microsoft Windows, Excel, Word, Outlook,
+PowerPoint, Microsoft Office, Microsoft Teams, Zoom, Slack, Google Workspace, "internet
+browsers", email, phones. Almost every office job in the corpus mentions these, and a posting
+saying "proficiency in Excel and Outlook" is describing literacy, not an investment. Emitting
+them puts a term in the vocabulary that matches thousands of companies and distinguishes none —
+it is pure noise in `technologies`, and it is worse than noise in a search for *"companies not
+using X"*, where it would silently delete half the corpus.
+
+The one exception is a role that is genuinely **about** the product: an "Excel VBA Developer" or
+a "Microsoft 365 Administrator". Then it is the work, and it counts.
+
+**2. Standards, code sets and regulations are not products.** `ICD-10`, `ICD-10-CM`, `CPT`,
+`HCPCS`, `MS-DRG`, `APR-DRG`, `HL7`, `FHIR`, `EDI`, `GAAP`, `HIPAA`, `ISO 9001`, `IFRS`, `SOX`.
+These are named and specific, and they still fail the include test: **you cannot buy or install
+them.** Nobody sells you ICD-10. They describe a body of knowledge the hire must have.
+
+This matters most in this corpus, because half of it is healthcare and those postings are dense
+with code sets. `technologies` is for the *products a vendor could sell* — an EMR, a claims
+platform, a data warehouse. The coding standard the hire works in belongs in `intents`
+(`icd-10 coding accuracy`, `drg assignment validation`), which is exactly what that field is for.
+
+An **unnamed** system is not a technology either: "our proprietary auditing system", "the
+in-house platform", "a leading EMR". If the posting will not name it, there is nothing to
+canonicalise and nothing to match. Leave it out.
+
+> Worked example — a Clinical DRG Auditor whose hint array reads `['ICD-10-CM', 'ICD-10-PCS',
+> 'MS-DRG', 'AP-DRG', 'APR-DRG', 'Microsoft Windows', 'Outlook', 'Excel', 'Word', 'PowerPoint',
+> 'Internet browsers', 'Microsoft Teams', 'Zoom']` and whose description names the EMR it audits
+> in as `Medent`:
+>
+> `technologies: ["Medent"]` — every code set is a standard, every Office/Zoom/browser entry is
+> general workplace software, and "Internet browsers" is not even a product. **One** term
+> survives, and that is the correct answer, not an under-extraction.
+
 **The connection must be stated, not inferred.** When a posting genuinely ties the role to a
 platform in words — "migrate our ECC instance to S/4HANA", "you will administer our Workday
 instance" — that platform IS role tech, so emit it. But do **not** reason from the role's domain
@@ -243,6 +304,11 @@ agrees with the "day to day / required / plus" sentences, trust it.
 
 ### Exclude — anything that is not a named product, plus anything out of scope above:
 - The company's ambient stack and collaboration tooling (see the scope rule)
+- **General workplace software**: Excel, Word, Outlook, PowerPoint, Microsoft Office, Windows,
+  Teams, Zoom, Slack, "internet browsers" — unless the role is *about* it (see the scope rule)
+- **Standards, code sets and regulations**: ICD-10, CPT, HCPCS, MS-DRG, HL7, EDI, HIPAA, GAAP,
+  ISO 9001 — named, but not buyable. They belong in `intents`, not here.
+- **Unnamed systems**: "our proprietary platform", "a leading EMR", "the in-house tool"
 - Service categories from the `services[]` hint: "Predictive Maintenance", "ERP Implementation",
   "Managed Hosting", "Systems Integration", "Data Migration", "Cloud Modernization", "MES
   Integration". These are **categories of work, not products.** They may inform `initiative`;
@@ -291,6 +357,13 @@ Rules:
 - **Strip all boilerplate**: degree requirements, years of experience, benefits, perks, EEO
   statements, "fast-paced environment", "team player", application instructions, salary.
 - Write it as a description of **the company's activity**, not of the advertisement.
+- **Never explain or justify your own field choices in the paraphrase.** It is read by a
+  salesperson, not by a reviewer of your work, and it is the text that gets embedded — so a
+  clause about what the posting *isn't* becomes searchable noise that matches the very queries it
+  denies. Wrong: *"...maintaining coding accuracy and compliance **without implementing new
+  systems or migrations**."* That trailing clause is you defending `initiative=MAINTENANCE`. Cut
+  it: *"...performing quality audits and giving feedback to coding and reimbursement
+  specialists."* The `initiative` field already carries that judgement.
 - If the posting genuinely carries no signal, write one plain sentence naming the role and the
   domain. Do not pad it and do not invent an initiative.
 - **Name a product here only if it is in your `technologies` list. No exceptions.**
@@ -311,15 +384,21 @@ Rules:
   > to build and operate services using dbt, supporting predictive-maintenance and ERP
   > implementation work."
 
-Good:
+Good — note that most of these are **not** manufacturing, because most of the corpus is not:
+> Healthcare provider hiring a clinical DRG auditor to validate inpatient coding and DRG
+> assignment, auditing records in Medent.
+
+> Retailer hiring a store systems analyst to roll out a new point-of-sale platform across its
+> locations, working with NCR and Oracle Retail.
+
+> Financial services firm hiring a payments operations analyst to support its migration off a
+> legacy core banking platform onto Temenos.
+
 > Industrial manufacturer migrating SAP ECC to S/4HANA with a Snowflake data layer, hiring an
 > architect to own the target design.
 
 > Electronics manufacturer hiring a data engineer to build pipelines in Airflow and dbt,
 > modernizing its production-floor systems.
-
-> Manufacturer hiring a maintenance planner to support predictive-maintenance work on the
-> production floor, using Spark and dbt.
 
 Bad — and why:
 > "Acme Industrial is seeking a passionate Data Engineer to join our fast-paced team in
@@ -334,6 +413,106 @@ Bad — and why:
 > (built around the company's ambient stack, which is NOT what this role works on — the reader
 > concludes the company is hiring for SAP when it is hiring a quality engineer; and "senior" was
 > invented from years demanded, not taken from the title)
+
+## Field: `intents`
+
+**3–6 short phrases naming the initiatives this posting is evidence of.** Lowercase noun
+phrases, 2–5 words each.
+
+This is a *finer grain* than `paraphrase`, not a summary of it. The paraphrase is one sentence a
+human reads; these are the individual, separately-matchable pieces of work the posting implies.
+A search for "erp transformation program" must be able to hit this posting even though those
+exact words never appear in the paraphrase.
+
+### Shape
+
+Write them the way these are written — the vocabulary is shared across thousands of postings and
+only matches if everyone spells a thing the same way:
+
+```
+erp transformation program          sap ecc to snowflake pipelines      modernization roadmap
+global finance process standardization                                  capacity planning
+supplier agreement negotiation      data lineage and security           security review
+record-to-report process documentation                                  process constraint analysis
+```
+
+Those examples come from an existing vocabulary built on ERP-heavy postings. **Half this corpus
+is healthcare**, and the same shape applies there — these are equally good intents:
+
+```
+icd-10 coding accuracy              drg assignment validation           revenue cycle compliance
+claims denial management            emr rollout support                 patient intake redesign
+prior authorization workflow        clinical documentation improvement  payer contract analysis
+```
+
+- **Lowercase. No punctuation.** Not title case, not sentence case.
+- **A noun phrase naming work**, never a sentence, never a duty list, never a role title.
+- 2–5 words. One idea per phrase. If a phrase needs an "and" joining two unrelated ideas, it is
+  two phrases — except where the pairing is the idea itself ("data lineage and security").
+- Prefer the generic form over the hyper-specific one **when the posting supports both**:
+  `erp transformation program`, not `acme's 2026 erp transformation program`.
+
+### The scope rule — the same one that governs `technologies`, applied to work
+
+An intent must name work **the posting says is happening**. The role must plausibly serve it, and
+the posting must have *said so* rather than implied it.
+
+The trap is identical to the one in `technologies`, and just as expensive: a posting that sets
+the scene with "our stack runs on SAP, Snowflake, AWS" and then describes a quality engineer's
+duties has **no** intent about SAP. Not `sap modernization`, not `erp transformation program`.
+The company owns SAP; the posting never said it is doing anything to it. Manufacturing an intent
+from an inventory of the company's systems is exactly the invented signal this whole record
+exists to avoid.
+
+| Posting says | Intent? |
+|---|---|
+| "you will migrate our ECC instance to S/4HANA" | **yes** — `sap ecc to s4hana migration` |
+| "supporting our Workday rollout" | **yes** — `workday rollout support` |
+| "you will document current-state processes ahead of the ERP program" | **yes** — `erp transformation program`, `process documentation` |
+| "our stack runs on SAP, Snowflake, AWS" *(and nothing else about them)* | **no** — ambient inventory, no work stated |
+| "we are investing in digital transformation" *(no specifics anywhere)* | **no** — names no work |
+
+`technologies` and `intents` answer different questions and legitimately differ: `technologies` is
+strictly what **this hire** works with; an intent may name the **program the hire contributes
+to**, which is broader. A procurement role can have `supplier agreement negotiation` with an
+empty `technologies` list. That is correct, not a gap.
+
+### Drive them from the description, not the title
+
+**Two postings with the same title at different companies must not get the same intent set** —
+unless their descriptions really do describe the same work. The intents come from *what the
+description says this role will do*, so a "Business Analyst" documenting finance processes and a
+"Business Analyst" tuning supplier contracts share a title and share nothing here.
+
+If you find yourself emitting a set that would fit any posting with this title, you are
+templating from the title. Re-read the description and name what *it* says.
+
+### Non-IT postings have intents too
+
+Most postings in this corpus are shop-floor, quality, maintenance, procurement and supply-chain
+roles. They are not `OTHER`-shaped here — `capacity planning`, `supplier performance monitoring`,
+`preventive maintenance program`, `production line qualification` are all good intents. `function`
+being `OTHER` says the role is not an IT role; it does not say the posting names no work.
+
+### Do not emit
+
+- **Role titles or seniority**: `senior data engineer`, `hiring an architect`.
+- **Bare product names**: `snowflake`, `aws`. A product is not an initiative — `technologies`
+  already carries it. `sap ecc to snowflake pipelines` is fine: it names *work*, and the products
+  are how the work is described.
+- **Boilerplate as work**: `competitive benefits`, `team collaboration`, `fast-paced environment`,
+  `equal opportunity employer`.
+- **Generic filler that matches everything**: `digital transformation` on its own,
+  `technology improvement`, `business support`, `various projects`.
+- **Skills and methods as intents**: `python programming`, `strong communication`, `six sigma`
+  — unless the posting describes the *program*, e.g. `six sigma deployment`.
+
+### Declining
+
+An empty list is a valid answer when the posting genuinely names no work — a pure duty list with
+no direction of travel. **Emit 3–6 when the work is there; emit fewer, or none, rather than pad.**
+Padding with generic filler is worse than a short list: filler matches every query weakly and
+degrades every ranking it touches.
 
 ## Field: `confidence`
 

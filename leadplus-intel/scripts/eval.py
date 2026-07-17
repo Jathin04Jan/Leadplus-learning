@@ -469,6 +469,47 @@ async def tune(queries: list[dict[str, Any]]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _assert_labels_still_valid(queries: list[dict]) -> None:
+    """Refuse to score labels that were authored against a corpus that no longer exists.
+
+    `golden.yaml`'s labels are `lead_company.id` values from the synthetic 301-company corpus.
+    The database now holds the real clone, where those ids identify different real companies —
+    so the labels are random pointers and every metric computed from them is meaningless.
+
+    This raises rather than warns, and that is the point (CHANGES-v2 §1): the failure mode being
+    prevented is not a wrong number, it is a CONFIDENT wrong number. An eval that reports
+    precision@10 = 0.412 against arbitrary companies is indistinguishable from a working one, and
+    it is exactly the "560 unit tests pass while search returns garbage" pathology (§14) rebuilt
+    inside the tool that was supposed to detect it. A tool that cannot say "these labels are not
+    about this data" will lie with a decimal point.
+    """
+    labelled = {cid for q in queries for cid in (q.get("relevant") or [])}
+    if not labelled:
+        return
+    from intel import repository  # local: keeps the import cost off --help
+
+    with repository.connect() as conn:
+        row = conn.execute(
+            "SELECT count(*) AS n FROM lead_company WHERE active"
+        ).fetchone()
+        active = row["n"]  # type: ignore[index]
+
+    # The labels were authored against 301 synthetic companies with ids 1-301. A corpus two
+    # orders of magnitude larger is a different corpus, whatever the ids happen to resolve to.
+    if active > 1000 and max(labelled) <= 301:
+        raise SystemExit(
+            "REFUSING to evaluate: evals/golden.yaml's labels are stale.\n\n"
+            f"  labels reference company ids 1..{max(labelled)} (the synthetic 301-company corpus)\n"
+            f"  the database holds {active:,} active companies (the real clone)\n\n"
+            "  Those ids now identify DIFFERENT REAL COMPANIES, so every relevant/forbidden list\n"
+            "  is a random pointer and precision@10 computed from them would be meaningless —\n"
+            "  meaningless AND confident, which is worse than no number at all.\n\n"
+            "  Regenerate the labels by re-running each query's recorded `rule` against the real\n"
+            "  corpus, then delete this guard's trigger by updating golden.yaml. See the banner\n"
+            "  at the top of that file."
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="http://localhost:8000", help="base URL of the API")
@@ -477,6 +518,7 @@ def main() -> int:
     args = parser.parse_args()
 
     queries = yaml.safe_load(GOLDEN.read_text(encoding="utf-8"))["queries"]
+    _assert_labels_still_valid(queries)
     if args.only:
         queries = [q for q in queries if q["id"] == args.only]
         if not queries:

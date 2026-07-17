@@ -108,7 +108,19 @@ class QueryIntent(str, Enum):
 
 
 class SignalRecord(BaseModel):
-    """§5.2 stage 2 — the normalized form of one job posting."""
+    """§5.2 stage 2 — the normalized form of one job posting.
+
+    Two grains, one call. `paraphrase` is the sentence a salesperson reads instead of the job ad
+    — the UI evidence line, and the product (§1). `intents` is the finer grain adopted from the
+    other team's `lead_company_job_intent`: ~3-6 short phrases naming the initiatives the posting
+    implies. Neither replaces the other. A paraphrase ranks and *explains*; an intent phrase
+    matches a query like "erp transformation program" that the paraphrase would only ever match
+    diffusely.
+
+    They are emitted by ONE call because they are two readings of one document — the model has
+    already done the comprehension, and a second call would pay for it twice and let the two
+    readings disagree.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -120,6 +132,9 @@ class SignalRecord(BaseModel):
         description="Named products/platforms only; raw extraction, canonicalised in stage 3."
     )
     paraphrase: str = Field(description="1-2 sentences, signal only, no boilerplate.")
+    intents: list[str] = Field(
+        description="3-6 short lowercase intent phrases (2-5 words), from the description only."
+    )
     confidence: float = Field(description="0..1 confidence in this extraction.")
 
 
@@ -220,6 +235,27 @@ class JobSignalRow(BaseModel):
     posted_date: dt.datetime | None = None
     prompt_version: str
     model: str
+
+
+class JobIntentRow(BaseModel):
+    """A `job_intent` row, ready to upsert — one intent phrase, not one job.
+
+    `source` is the column their table lacks. It is what makes a UNION of ours and theirs
+    attributable, and it defaults to ours because we only ever write our own rows.
+
+    There is no `intent_canonical`, deliberately (§5.8). An intent is a descriptive phrase with no
+    official form to snap to — 5,209 of 8,114 phrases are distinct, and the ladder resolved 3.9%
+    of them at cosines of 0.32-0.52. The phrase and its embedding ARE the record; matching is
+    semantic. Canonicalising here would be `SAP`->`Sapient` rebuilt inside its own replacement.
+    """
+
+    job_id: int
+    company_id: int
+    intent: str
+    intent_embedding: list[float] | None = None
+    prompt_version: str
+    model: str
+    source: str = "leadplus-intel"
 
 
 class CompanySignalRow(BaseModel):
@@ -385,6 +421,10 @@ class Evidence(BaseModel):
     paraphrase: str
     matched_terms: list[str] = Field(default_factory=list)
     technologies: list[str] = Field(default_factory=list)
+    # The finer grain (`job_intent`), shown alongside the paraphrase. The paraphrase says what
+    # the posting is; these say what it is evidence OF, and they are what an intent-phrased query
+    # actually matched on — so a card that omits them can be ranked by something invisible.
+    intents: list[str] = Field(default_factory=list)
     function: str | None = None
     seniority: str | None = None
     initiative: str | None = None

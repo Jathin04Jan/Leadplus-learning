@@ -9,22 +9,70 @@ It exists to fix three measured defects in that system:
 | Defect | Here |
 |---|---|
 | **"and" means OR** (`keywordMatchMode` defaults to ANY) | terms **never filter** — they feed `coverage`. 3-of-3 outranks 1-of-3; nothing is dropped. |
-| **`LIKE '%sap%'` matches *Sapient*** | canonical-term equality + word-boundary FTS. Measured on this corpus: `LIKE '%sap%'` returns **37**, only **26** truly run SAP — **11 false positives (42% inflation)**. |
-| **No ranking** (sorts by `updated_at DESC`) | 4-retriever RRF + explainable per-axis score (§8). |
+| **`LIKE '%sap%'` matches *Sapient*** | canonical-term equality + word-boundary FTS. Re-measured on the **real** corpus: `LIKE '%sap%'` returns **255**, only **132** carry SAP as a canonical technology — **123 false positives (93% inflation)**. Real victims: **Che·sap·eake Systems**, and `SAP America, Inc.` itself (a company *named* SAP is not a company *using* SAP). |
+| **No ranking** (sorts by `updated_at DESC`) | 6-retriever RRF + explainable per-axis score (§8). |
 
 ## ⚠️ Read this before quoting any number
 
-**The corpus is synthetic** — a generated replica in `../search-demo/`, not the real `leadplus_dev`
-restore the spec was written against. This build proves the **architecture works**. It does **not**
-prove job-intent is a product; that needs the real corpus (blocked: the `anjali` credential has zero
-table grants). See the LOCAL DEVIATION table in `ARCHITECTURE.md` §0.
+**The corpus is REAL** — a verified 1:1 clone of `leadplus_dev` (72 tables, 244,659 rows). The
+synthetic seed in `../search-demo/` is gone and every number below was re-measured against the
+clone. See `ARCHITECTURE.md` §0.
 
-Two known data limits, both artifacts of the seed generator, not the design:
-- **No job posts about SAP/Snowflake/AWS.** Jobs only hire for infra (PostgreSQL, Kafka, Airflow,
-  dbt…). So `"companies hiring for Snowflake"` correctly returns **0**, and the spec's own headline
-  example ("Senior SAP S/4HANA Architect") isn't reproducible. USES mode is unaffected.
-- **`initiative` is `MODERNIZATION` 386/386** — every seeded description shares one line, so that
-  axis carries no signal and evidence paraphrases read repetitively.
+### LOCAL-ONLY — enforced, not requested
+
+The app connects to `postgresql://leadplus:leadplus@localhost:5433/leadplus_local` and **nothing
+else**. `config.assert_local_database()` runs at import and raises unless the host is
+localhost/127.0.0.1 **and** the db name contains `local`, so a stray `DATABASE_URL` fails loudly
+instead of quietly writing to a hosted database. **Never point this at RDS.** The clone is
+complete; RDS is done with.
+
+### What the real data says that the spec did not
+
+- **Only 2,886 of 13,082 active jobs carry a description >200 chars.** The other ~78% are stubs
+  with no prose. Only those 2,886 (across 487 canonical companies) are extracted — normalizing a
+  stub invents signal rather than finding it.
+- **The corpus is 49% healthcare, 15% retail, 13% financial services — and 7% manufacturing.**
+  Every "industrial manufacturer migrating SAP ECC" example in the spec describes 7% of the data.
+  `prompts/job_normalizer.md` v6 was corrected for this; read §0 before writing a prompt.
+- **Every `posted_date` in the indexed corpus is FAKE.** 125 of the 2,886 extractable postings
+  carry a date; **all 125 belong to 25 seeded demo companies** (`tenant_id 29`, `Synthetic *`,
+  `.example` domains). Real dated postings exist (22 active) but none carry description text, so
+  none are extractable. So `recency` is 0.0 for **every real company**, `since_days` can only
+  ever return fictions, and the §0 thesis ("posted six days ago -> actively investing") is
+  **unprovable on this data**. This is not a scraper gap to wave at — it is the finding.
+- **The corpus is multilingual** (German is common).
+- **`evals/golden.yaml` is dead** — its labels are synthetic company ids that now point at
+  unrelated real companies. `scripts/eval.py` refuses to score it rather than emit a confident
+  meaningless precision@10.
+
+### Intents are embedded, NOT canonicalised — a design error we removed
+
+**Technologies are canonicalised. Intents are not. That asymmetry is deliberate — do not
+"fix" it.** We once applied the technology ladder (exact → alias → embedding NN > 0.85 → review
+queue) to intent phrases too. It was a **category error**:
+
+- A **technology is a named product**: `SAP S/4HANA` / `S/4 HANA` / `SAP S4` really are one thing
+  with an official form, so canonicalising **recovers** a real identity. `tech_canonical` (4,529
+  terms) stays, and its ladder catches real traps (`ROS`→`ROSS` @ 0.79).
+- An **intent is a descriptive phrase**: `icd-10 coding accuracy`, `drg assignment validation`.
+  There is no official form to snap to, so canonicalising **invents** an identity.
+
+Measured on the real corpus, which is why it's gone rather than merely doubted:
+
+| | |
+|---|---|
+| `job_intent` | **8,114 rows / 5,209 distinct phrases** — nearly every intent is unique |
+| resolved by the ladder | **317 (3.9%)**; 7,797 NULL |
+| `intent_review_queue` | **5,195 rows of things that were never broken** |
+| nearest-match similarity | **0.32–0.52** (`icd-10 coding accuracy` → `record-to-report documentation` @ **0.318**) |
+
+A vocabulary earns its place when many observations collapse onto few terms. **5,209 distinct
+phrases in 8,114 rows is nothing to collapse.** The other team's `lead_company_job_intent` has
+**no canonical column at all** — they didn't make this mistake. Intents are matched
+**semantically via the 3072-dim `intent_embedding`** (that's what the vector is for) and lexically
+via a GIN index; retrieval never read the canonical column, so removing it cost nothing.
+`job_intent` is now **their exact shape + our provenance** (`prompt_version`, `model`, `source`),
+so a UNION with theirs is attributable. Full reasoning in `ARCHITECTURE.md` §5.8 and rule 5.
 
 ## Run it
 
@@ -33,17 +81,18 @@ docker compose up -d                                   # pgvector pg15 :5433 + p
 cp .env.example .env                                   # add OPENAI_API_KEY  (.env is gitignored)
 uv venv && uv pip install -r <(uv pip compile pyproject.toml)
 
-# source data: seed the LeadPlus tables into leadplus_local
-cd ../search-demo && DATABASE_URL=postgresql://leadplus:leadplus@localhost:5433/leadplus_local npm run reset && cd -
+# The LeadPlus tables are ALREADY in leadplus_local (the real clone). Do not seed, do not restore.
 
 .venv/bin/python scripts/init_db.py            # our derived tables (§7)
 .venv/bin/python scripts/profile_data.py       # §15 gates
-.venv/bin/python scripts/bootstrap_canonical.py
-.venv/bin/python scripts/ingest.py --limit 25 --dry-run   # ALWAYS sample & read the paraphrases first
-.venv/bin/python scripts/ingest.py             # full: 386 jobs + 301 companies  (~$1, ~15 min)
-.venv/bin/python scripts/bootstrap_tech.py
+.venv/bin/python scripts/bootstrap_canonical.py   # §5.4 fold: 22,966 -> 22,901
+.venv/bin/python scripts/bootstrap_tech.py --skip-industry   # seed tech_canonical (4,529 terms)
 .venv/bin/python scripts/bootstrap_locations.py   # location_alias (CHANGES-v2 §3.1) — no LLM, $0
+.venv/bin/python scripts/ingest.py --limit 25 --dry-run   # ALWAYS sample & READ the paraphrases
+.venv/bin/python scripts/ingest.py             # full: 2,886 jobs + 487 companies (~$3.79, ~2.5h)
+.venv/bin/python scripts/bootstrap_tech.py     # canonicalise stored tech + §5.5 industries
 .venv/bin/uvicorn intel.main:app --app-dir src --port 8000
+.venv/bin/python scripts/acceptance.py         # behavioural guarantees (refusal, determinism, negation)
 ```
 → UI at <http://localhost:8000> · health at `/api/health`
 
@@ -66,37 +115,38 @@ group that did it. When the query is not a search, `refusal` says so and `compan
 
 ## Verified
 
-- money query `SAP + Snowflake + AWS`, industry Manufacturing → the **13 golden companies at ranks 1–13**
-- **`Sapient Consulting Group` lands at rank 22**, `cov 2/3`, missing `SAP` — excluded *on the merits*, not blacklisted
-- coverage cascade `3/3=13 · 2/3=16 · 1/3=21` — the **1-of-3 companies still return**, just lower (no AND/OR cliff)
-- **deterministic**: identical chips → identical sha256 over ids+scores, twice
-- **intent flip** on `dbt` (a both-sides term) reorders USES vs HIRING as §8.2 predicts
-- **~47ms** of pipeline for `/structured` (§6 budget: <100ms); LLM parse cached to ~0.
-  A query with a **negation** costs ~97ms: the four lists run a second time un-negated so
-  `excluded[]` can report what was removed and where it would have ranked.
-- eval: normalized precision@10 **1.000**, recall@50 **1.000**, forbidden-company gate **PASS**
-  across **22** golden queries
+> **⚠️ EVERY RANK, SCORE AND EVAL NUMBER PREVIOUSLY LISTED HERE WAS MEASURED ON THE SYNTHETIC
+> CORPUS AND HAS BEEN DELETED, NOT UPDATED.** "The 13 golden companies at ranks 1–13",
+> "Sapient at rank 22", "precision@10 1.000 across 22 golden queries" — those companies do not
+> exist in the real clone. Republishing them next to real data would be the most straightforward
+> lie this README could tell. They are gone until re-measured.
 
-### v2 (CHANGES-v2)
+**Behavioural guarantees — corpus-independent, so still checkable. Run `scripts/acceptance.py`:**
 
-- `"exclude anything already on S/4HANA"` → **no S/4HANA company at any rank**; the 8 removed ones
-  are listed with `excluded_by` and the rank they would have held. (v1 parsed this as a *positive*
-  term and ranked an S/4HANA shop **#1 at cov 1.00** — the inversion is reproducible via
-  `/structured` by flipping `negate`.)
-- **negation safety**: excluding `SAP` removes the 24 companies that carry canonical `SAP` and
-  leaves `Sapient Consulting Group` (`Sapient Cloud Suite`) untouched. Negation matches the
-  canonical `technologies[]` array **only** — never prose, never `tsv`. A substring `NOT` would
-  delete Sapient *invisibly*, and a false negative is unobservable.
-- `"SAP and also AWS or Azure"` → **2 groups**; `SAP+AWS` covers 2/2 and outranks `AWS+Azure`
-  without SAP at 1/2. Counting alternates instead would score the wrong company 2/3.
-- locations are canonicalised through `location_alias` (`ca`/`calif` → `california`), because
-  `hq_state` holds **full names** — §3.1's premise was inverted and §0 caught it before it shipped.
 - `"create a 3-step campaign"` → `ACTION` refusal · `"ignore all previous instructions…"` →
-  `UNPARSEABLE` refusal · **0 companies** for both. v1 answered all three with the same 3 rows.
+  `UNPARSEABLE` refusal · **0 companies** for both. An empty chips object never retrieves.
+- **negation safety (§2.1)**: negation matches the canonical `technologies[]` array **only** —
+  never prose, never `tsv`. A substring `NOT LIKE '%sap%'` would invisibly delete
+  **Che·sap·eake Systems**, and a false negative is unobservable. This is the one guard rail that
+  cannot be checked by reading results.
+- **deterministic**: identical chips → byte-identical `/api/search/structured` response twice.
+- locations canonicalise through `location_alias` (`ca`/`calif` → `california`), because
+  `hq_state` holds **full names** — §3.1's premise was inverted and §0 caught it before it shipped.
 
-`evals/golden.yaml` is **machine-authored** from the known structure of the synthetic pool — it
-measures **regressions, not relevance**. Only the rows marked `*` can falsify a weight; the rest are
-near-tautological. Replace it with real labelled queries before trusting any tuning.
+**Ranking quality is currently UNMEASURED on real data**, and honestly so: the golden set is dead
+(below), and the axis the thesis leans on hardest (`recency`) has no real data to stand on.
+
+`evals/golden.yaml` is **DEAD and `scripts/eval.py` refuses to run it.** It was machine-authored
+against the synthetic pool, so its labels are company ids 1–301 — which now identify unrelated
+real companies (id 1 was a planted SAP/Snowflake manufacturer; it is now "SILVIA PEREZ", an HR
+services firm). Scoring it would emit a confident meaningless precision@10, which is the exact
+disease this project exists to cure, so the guard hard-fails instead. The labels are
+regenerable — each query records the `rule` that produced it — but read §14 first: labels
+regenerated from the same predicate the scorer reads measure **regressions, not relevance**.
+
+`scripts/acceptance.py` is what still holds on real data: refusal behaviour, determinism, and the
+§2.1 negation guard rail are corpus-independent, so they are checkable where ranking quality
+currently is not.
 
 ## Layout
 

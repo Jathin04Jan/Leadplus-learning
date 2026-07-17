@@ -5,8 +5,11 @@
 Idempotent. `--drop` tears our tables down first — they are derived, disposable and rebuildable
 from `lead_company*` + the prompts, so dropping them costs only a re-ingest.
 
-This NEVER touches `lead_company`, `lead_company_job` or `lead_query` (§2, §7). `--drop` names
-our six tables explicitly rather than dropping a schema, so it cannot reach a LeadPlus table.
+This NEVER touches `lead_company`, `lead_company_job`, `lead_query` (§2, §7) or
+`lead_company_job_intent` (another team's). `--drop` names our tables explicitly rather than
+dropping a schema, and asserts the `lead_` prefix is absent, so it cannot reach any of them —
+note in particular that OUR `job_intent` and THEIR `lead_company_job_intent` are different
+tables, and only the first is on this list.
 """
 
 from __future__ import annotations
@@ -22,6 +25,10 @@ OUR_TABLES = (
     "ingest_dead_letter",
     "tech_review_queue",
     "tech_canonical",
+    # `intent_canonical` / `intent_review_queue` are deliberately absent: they were a category
+    # error (an intent is a phrase, not a product) and are dropped, not recreated. See §5.8.
+    "job_intent",  # OURS. `lead_company_job_intent` is theirs and is NOT here.
+    "location_alias",
     "company_signal",
     "job_signal",
     "company_canonical",

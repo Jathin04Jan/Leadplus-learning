@@ -199,6 +199,10 @@
   }
   .tag.hit { background: #10281f; border-color: #1d5f43; color: var(--good); }
   .tag.miss { background: #241618; border-color: #5c2b2b; color: #d98a7c; text-decoration: line-through; }
+  /* job_intent — the finer grain. Deliberately quieter than .hit: an intent is context for the
+     paraphrase above it, not a claim that the user's term matched. */
+  .tag.intent { background: #1a1c24; border-color: #2f3446; color: #97a0bd; }
+  .job-intents { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px; }
 
   details.why { margin-top: 12px; }
   details.why summary {

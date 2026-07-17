@@ -165,10 +165,25 @@ class TermMatcher:
 
     def __init__(self, vocabulary: Iterable[dict[str, Any]]) -> None:
         # key -> canonical term, over both the terms and their aliases.
+        #
+        # **Terms first, aliases second — the same precedence as the §5.2 stage-3 ladder**, which
+        # tries exact before alias. This used to be one pass of `setdefault` over both, which
+        # meant a phrase that was both a term and another term's alias resolved to whichever the
+        # ORDER BY term happened to reach first. `SAP ECC` lost that race to `SAP` (S < ' '), so
+        # a query for SAP ECC scored coverage 1.00 against companies running plain SAP and the 20
+        # real ECC shops matched nothing.
+        #
+        # `bootstrap_tech.py` now forbids that collision outright (THE INVARIANT), so this loop
+        # should never see one. The two passes stay anyway: the ladder and this matcher read the
+        # SAME table and must never disagree about what it says — and if the table ever does
+        # drift, a canonical term resolving to ITSELF is the safe failure.
+        rows = list(vocabulary)
         self._by_key: dict[str, str] = {}
-        for row in vocabulary:
+        for row in rows:
             term = row["term"]
             self._by_key.setdefault(tech_key(term), term)
+        for row in rows:
+            term = row["term"]
             for alias in row.get("aliases") or []:
                 self._by_key.setdefault(tech_key(alias), term)
 
@@ -496,6 +511,7 @@ def rank(
                     paraphrase=job.get("paraphrase") or "",
                     matched_terms=per_job_matches.get(job["job_id"], []),
                     technologies=job.get("technologies") or [],
+                    intents=job.get("intents") or [],
                     function=job.get("function"),
                     seniority=job.get("seniority"),
                     initiative=job.get("initiative"),

@@ -8,6 +8,13 @@ system this project exists to replace. Everything in this file is the alternativ
 Nothing here auto-guesses. When a term cannot be resolved with evidence it goes to
 `tech_review_queue` for a human. `Sapient Cloud Suite` is the live test of that: it *looks* like
 SAP and is not, and no stage in this file is permitted to decide otherwise on resemblance.
+
+**What this file deliberately does NOT canonicalise: intent phrases (§5.8).** Rule 5 is "enums
+where closed, canonicalise where LONG-TAIL" — it is not "canonicalise everything". A technology is
+a named product with an official form; an intent (`icd-10 coding accuracy`, `embedded electronics
+design`) is a description of work and has none. Applying this ladder to intents was tried and
+measured: 5,209 distinct phrases in 8,114 rows, 3.9% resolved, nearest-match cosines 0.32-0.52. It
+was removed. Intents are matched semantically via `job_intent.intent_embedding`.
 """
 
 from __future__ import annotations
@@ -148,30 +155,72 @@ class TechResolution:
 class TechCanonicalizer:
     """The §5.2 stage-3 ladder: exact -> alias -> embedding NN >0.85 -> review queue.
 
-    Per-run memo cache: the corpus repeats the same handful of terms hundreds of times, and an
-    unresolved term must be counted once per occurrence in the queue but embedded only once.
+    The technology vocabulary, bootstrapped from Apollo's curated `lead_company.technologies[]`.
+
+    **This ladder is for TECHNOLOGIES ONLY, and that is rule 5 read correctly.** It was once a
+    generic base class with a second subclass for intent phrases; that was a category error and
+    the class hierarchy was its main symptom. A technology is a named product — `SAP S/4HANA` /
+    `S/4 HANA` / `SAP S4` are one thing, so snapping them to an official form is right and the
+    ladder is load-bearing (`ROS` -> `ROSS` @ 0.79 is a real trap it catches). An intent is a
+    descriptive phrase — `icd-10 coding accuracy` — with no official form to snap to, measured at
+    5,209 distinct phrases in 8,114 rows and 3.9% resolution. Intents are matched semantically via
+    `job_intent.intent_embedding`. Do not re-generalise this class to reach them.
+
+    Per-run memo cache: the corpus repeats the same handful of terms hundreds of times, and each
+    distinct term must be embedded and resolved only once.
+
+    **Caveat on `occurrences`, because the column's name over-promises:** the cache means a
+    repeated term short-circuits before `_enqueue_review`, so `occurrences` counts *first
+    sightings*, not corpus frequency — it is ~1 for nearly everything and cannot be used to
+    prioritise the review queue by weight. It is left as-is rather than "fixed" by re-enqueuing on
+    every hit: a counter that has to be maintained is worse than a GROUP BY over the data itself,
+    and `tech_review_queue` is small enough (875) to read whole.
     """
+
+    queue_name = "tech_review_queue"
 
     def __init__(self, conn: psycopg.Connection) -> None:
         self.conn = conn
         self._cache: dict[str, TechResolution] = {}
 
+    # --- the vocabulary calls ---------------------------------------------------------------
+    def _key(self, term: str) -> str:
+        return tech_key(term)
+
+    def _find_exact(self, key: str) -> str | None:
+        return repository.find_tech_exact(self.conn, key)
+
+    def _find_alias(self, key: str) -> str | None:
+        return repository.find_tech_alias(self.conn, key)
+
+    def _find_nearest(self, vector: list[float]) -> tuple[str, float] | None:
+        return repository.find_tech_nearest(self.conn, vector)
+
+    def _add_alias(self, term: str, alias: str) -> None:
+        repository.add_tech_alias(self.conn, term, alias)
+
+    def _enqueue_review(self, *, raw_term: str, nearest: str | None, similarity: float | None) -> None:
+        repository.enqueue_tech_review(
+            self.conn, raw_term=raw_term, nearest=nearest, similarity=similarity
+        )
+
+    # --- the ladder ------------------------------------------------------------------------
     async def resolve_many(self, terms: list[str]) -> dict[str, TechResolution]:
         """Resolve a list of raw terms. Returns raw_term -> resolution (canonical may be None)."""
         unique = list(dict.fromkeys(t.strip() for t in terms if t and t.strip()))
         todo: list[str] = []
 
         for term in unique:
-            key = tech_key(term)
+            key = self._key(term)
             if not key:
                 continue
             if key in self._cache:
                 continue
-            hit = repository.find_tech_exact(self.conn, key)
+            hit = self._find_exact(key)
             if hit:
                 self._cache[key] = TechResolution(term, hit, "exact", 1.0, hit)
                 continue
-            hit = repository.find_tech_alias(self.conn, key)
+            hit = self._find_alias(key)
             if hit:
                 self._cache[key] = TechResolution(term, hit, "alias", 1.0, hit)
                 continue
@@ -180,19 +229,19 @@ class TechCanonicalizer:
         if todo:
             vectors = await embed.embed_texts(todo)
             for term, vector in zip(todo, vectors):
-                key = tech_key(term)
-                nearest = repository.find_tech_nearest(self.conn, vector)
+                key = self._key(term)
+                nearest = self._find_nearest(vector)
                 if nearest and nearest[1] > config.TECH_NN_THRESHOLD:
                     canonical, similarity = nearest
                     # "hit + record alias" (§5.2 stage 3) — the next run takes the cheap path.
-                    repository.add_tech_alias(self.conn, canonical, term)
+                    self._add_alias(canonical, term)
                     self._cache[key] = TechResolution(term, canonical, "embedding", similarity, canonical)
                 else:
                     # Below threshold: a human resolves this. We NEVER auto-guess.
                     nearest_term = nearest[0] if nearest else None
                     similarity = nearest[1] if nearest else None
-                    repository.enqueue_tech_review(
-                        self.conn, raw_term=term, nearest=nearest_term, similarity=similarity
+                    self._enqueue_review(
+                        raw_term=term, nearest=nearest_term, similarity=similarity
                     )
                     self._cache[key] = TechResolution(
                         term, None, "unresolved", similarity, nearest_term
@@ -200,7 +249,7 @@ class TechCanonicalizer:
 
         out: dict[str, TechResolution] = {}
         for term in unique:
-            key = tech_key(term)
+            key = self._key(term)
             if key in self._cache:
                 resolution = self._cache[key]
                 out[term] = TechResolution(
@@ -215,7 +264,7 @@ class TechCanonicalizer:
     async def canonical_list(self, terms: list[str]) -> list[str]:
         """Map raw terms -> deduped canonical terms. Unresolved terms are dropped, not guessed.
 
-        Dropping is deliberate: an unresolved term is already recorded in `tech_review_queue`.
+        Dropping is deliberate: an unresolved term is already recorded in the review queue.
         Writing the raw term into `technologies` would put an uncontrolled value into a
         controlled vocabulary — which is the exact failure rule 5 forbids.
         """
@@ -249,7 +298,7 @@ class IndustryResolution:
 
 def _cosine(a: list[float], b: list[float]) -> float:
     dot = sum(x * y for x, y in zip(a, b))
-    # text-embedding-3-small returns unit-norm vectors, so the dot product IS the cosine.
+    # text-embedding-3-large returns unit-norm vectors, so the dot product IS the cosine.
     return dot
 
 

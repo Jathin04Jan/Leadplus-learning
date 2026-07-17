@@ -37,16 +37,64 @@ from intel import canonicalize, config, embed, llm, repository
 #
 # `aliases` are the spellings we already know are the same product. The alias for SAP S/4HANA is
 # the concrete case rule 5 names: without it, "SAP S4" and "S/4HANA" become separate terms.
+#
+# ---------------------------------------------------------------------------------------------
+# THE INVARIANT — read before adding anything here.
+#
+#     No phrase may be both a canonical term and an alias of a DIFFERENT term.
+#
+# It is enforced twice and never by hand: `_alias_owners` fails loudly if THIS dict breaks it,
+# and `verify_invariant` fails the run if the DATABASE breaks it. `reconcile` is what makes the
+# database obey, and this dict is the only thing that decides HOW:
+#
+#   * declaring a phrase as an alias  -> MERGE: any standalone term for it is DELETED and its
+#     rows migrate to the owner. Say this when the standalone is the SAME PRODUCT.
+#   * NOT declaring it                -> SPLIT: the standalone term stands on its own and the
+#     stale alias is pruned off whichever term used to claim it. Say this when it is a
+#     DIFFERENT PRODUCT.
+#
+# This dict is therefore the classification. There is no second place to look.
+#
+# Why the invariant exists: `tech_canonical` is built from this dict UNION the ~4,529 distinct
+# values of Apollo's `lead_company.technologies[]`, and Apollo carries `Amazon AWS` and `SAP ECC`
+# as values of its own. A phrase that is both a term and an alias breaks the §5.2 stage-3 ladder
+# silently, because the ladder tries exact BEFORE alias and so never reaches the alias step. Both
+# failure modes were measured on this corpus:
+#
+#   fragmentation: 65 companies use AWS -> 40 stored `Amazon AWS`, 25 `AWS`, ZERO overlap.
+#                  A search for AWS returned 25 of 65. The other 40 were invisible.
+#   conflation:    query `SAP ECC` resolved to canonical `SAP`, coverage 1.00, and not one
+#                  result carried SAP ECC. The 20 companies that genuinely run ECC matched
+#                  nothing.
+# ---------------------------------------------------------------------------------------------
 SEED_TECH: dict[str, list[str]] = {
     # ERP / business systems
-    "SAP": ["SAP ERP", "SAP ECC", "ECC", "SAP R/3"],
+    #
+    # SAP is the VENDOR/GENERIC name. ECC, ERP and R/3 are the legacy on-prem products, and
+    # S/4HANA is the modern successor. They are NOT four spellings of one thing, so none of them
+    # is an alias of `SAP` — that is a SPLIT, and it is the whole product question (§0's wedge is
+    # "who is still on ECC and therefore has a migration ahead of them?"). Folding them together
+    # destroys the only thing this tool is for. Measured on this corpus: SAP 10 companies,
+    # SAP ECC 20, SAP ERP 6 — three different sets, and 2 companies carry ECC *and* ERP, which is
+    # Apollo telling us they are different attributes.
+    #
+    # `ECC` (the bare acronym) belongs to SAP ECC, not to SAP.
+    "SAP": [],
+    "SAP ECC": ["ECC"],
+    "SAP ERP": [],
+    "SAP R/3": [],
     "SAP S/4HANA": ["SAP S4", "S/4HANA", "S4 HANA", "S/4 HANA", "S4/HANA", "SAP S/4", "S4HANA",
                     "SAP S4HANA", "SAP S/4 HANA"],
-    "Oracle ERP": ["Oracle E-Business Suite", "Oracle EBS", "Oracle Fusion"],
+    # Oracle Fusion is the cloud successor to E-Business Suite, not a spelling of it — SPLIT, for
+    # the same reason as SAP ECC vs SAP S/4HANA.
+    "Oracle ERP": ["Oracle E-Business Suite", "Oracle EBS"],
+    "Oracle Fusion": [],
     "NetSuite": ["Oracle NetSuite"],
     "Microsoft Dynamics 365": ["Dynamics 365", "D365"],
     "Microsoft Dynamics CRM": ["Dynamics CRM"],
-    "Epicor Kinetic": ["Epicor"],
+    # Epicor is the vendor; Kinetic is the product. Same vendor-vs-product split as SAP.
+    "Epicor Kinetic": [],
+    "Epicor": [],
     "Infor CloudSuite": ["Infor"],
     "Workday": [],
     "Salesforce": ["SFDC", "Salesforce CRM"],
@@ -54,9 +102,28 @@ SEED_TECH: dict[str, list[str]] = {
     "Zoho CRM": ["Zoho"],
     "ServiceNow": [],
     # Cloud
-    "AWS": ["Amazon Web Services", "Amazon AWS"],
+    "AWS": ["Amazon Web Services", "Amazon AWS", "Amazon Web Services (AWS)"],
     "Microsoft Azure": ["Azure"],
     "Google Cloud Platform": ["GCP", "Google Cloud"],
+    # Apollo-vs-Apollo variants. These are NOT reachable by the ladder: Apollo's ~4,529 values
+    # are seeded as terms directly, so a variant is never resolved against its twin — it just
+    # becomes a second term, and the companies split silently between them.
+    #
+    # They are hand-curated, and they have to be. Cosine cannot make this call: the four pairs
+    # below sit at 0.865-0.972, and these sit in the SAME band and are DIFFERENT products —
+    #     Google Analytics / Yahoo Analytics ...... 0.904   (different vendors)
+    #     Google Maps (Non Paid) / (Paid Users) ... 0.874   (a deliberate licensing split)
+    #     DNSimple / DNS Made Easy ................ 0.861   (different vendors)
+    #     Infoblox DHCP / Infoblox DNS ............ 0.857   (different products)
+    #     Siemens SIMATIC S7 / SIMATIC SCADA ...... 0.852   (different products)
+    # Of the 12 same-band pairs where both sides carry companies, 8 are distinct products, so an
+    # auto-merge at 0.85 would be wrong 67% of the time — and wrong in the conflation direction,
+    # which is invisible. The ladder resolves an extracted term against a KNOWN vocabulary; it
+    # cannot dedupe a vocabulary against itself, because vendors name things alike on purpose.
+    "Microsoft Office 365": ["Office365"],
+    "Amazon Elastic Load Balancing": ["Amazon Elastic Load Balancer"],
+    "Azure Synapse Analytics": ["Azure Synapse"],
+    "Microsoft Azure Monitor": ["Azure Monitor"],
     # Data
     "Snowflake": [],
     "Databricks": [],
@@ -65,7 +132,8 @@ SEED_TECH: dict[str, list[str]] = {
     "Teradata": [],
     "PostgreSQL": ["Postgres"],
     "Kafka": ["Apache Kafka"],
-    "Spark": ["Apache Spark", "PySpark"],
+    "Spark": ["Apache Spark"],
+    "PySpark": [],
     "Airflow": ["Apache Airflow"],
     "dbt": ["dbt Labs", "data build tool"],
     # Platform / infra
@@ -85,35 +153,192 @@ SEED_TECH: dict[str, list[str]] = {
 }
 
 
-async def seed(conn, *, reseed: bool) -> None:
+class SeedContradiction(RuntimeError):
+    """The seed declares a phrase as both a term and a different term's alias. Never caught.
+
+    Loud on purpose. A contradictory seed does not produce a broken row you can spot — it
+    produces a vocabulary that silently resolves half a product's companies to the wrong term,
+    which is exactly how `Amazon AWS` hid 40 of 65 AWS users in plain sight for an entire corpus.
+    """
+
+
+def _alias_owners(seed: dict[str, list[str]]) -> dict[str, str]:
+    """`alias key -> owning term`, with THE INVARIANT enforced on the seed itself.
+
+    Three ways a seed can contradict itself, all fatal:
+      1. two terms that normalise to the same key (`Power BI` and `PowerBI` as *terms*),
+      2. a term that is also another term's alias (`SAP ECC` as a term and as SAP's alias),
+      3. one alias claimed by two different terms (`PySpark` under both Spark and Databricks) —
+         resolution would then depend on `find_tech_alias`'s arbitrary `LIMIT 1`.
+    """
+    term_by_key: dict[str, str] = {}
+    for term in seed:
+        key = canonicalize.tech_key(term)
+        if not key:
+            raise SeedContradiction(f"SEED_TECH term {term!r} normalises to an empty key")
+        if key in term_by_key:
+            raise SeedContradiction(
+                f"SEED_TECH declares two terms with the same key {key!r}: "
+                f"{term_by_key[key]!r} and {term!r}. One of them must go."
+            )
+        term_by_key[key] = term
+
+    owners: dict[str, str] = {}
+    for term, aliases in seed.items():
+        for alias in aliases:
+            key = canonicalize.tech_key(alias)
+            if not key:
+                raise SeedContradiction(
+                    f"SEED_TECH alias {alias!r} of {term!r} normalises to an empty key"
+                )
+            if key == canonicalize.tech_key(term):
+                continue  # a term restating itself is harmless
+            clash = term_by_key.get(key)
+            if clash is not None:
+                raise SeedContradiction(
+                    f"SEED_TECH breaks THE INVARIANT: {clash!r} is a canonical term AND is "
+                    f"declared as an alias of {term!r}.\n"
+                    f"  No phrase may be both. Decide which it is:\n"
+                    f"    MERGE — {clash!r} is the same product as {term!r}: delete the "
+                    f"{clash!r} entry, keep the alias.\n"
+                    f"    SPLIT — they are different products: delete the alias from "
+                    f"{term!r}, keep the {clash!r} entry."
+                )
+            owner = owners.get(key)
+            if owner is not None and owner != term:
+                raise SeedContradiction(
+                    f"SEED_TECH declares the alias {alias!r} under two terms: {owner!r} and "
+                    f"{term!r}. An alias has exactly one owner."
+                )
+            owners[key] = term
+    return owners
+
+
+async def seed(conn, *, reseed: bool) -> tuple[dict[str, str], dict[str, list[str]]]:
+    """Seed `tech_canonical` = SEED_TECH ∪ (Apollo's distinct values MINUS declared aliases).
+
+    That subtraction is THE INVARIANT's other half, and it is the entire fix. Apollo's curated
+    list carries `Amazon AWS` and `SAP ECC` as values in their own right. Add them as standalone
+    terms and the stage-3 ladder — which tries **exact before alias** — matches `Amazon AWS`
+    against its own term and never reaches the alias step that would have sent it to `AWS`. The
+    alias becomes dead code, and the corpus splits in two without a single error.
+    """
+    alias_owner = _alias_owners(SEED_TECH)  # loud, and before anything touches the database
+
     apollo = repository.distinct_apollo_technologies(conn)
     print(f"Apollo distinct lead_company.technologies[] : {len(apollo)} terms")
     print(f"hand-seeded SI-relevant platforms           : {len(SEED_TECH)} terms")
+    print(f"aliases declared by the seed                : {len(alias_owner)}")
 
-    # Apollo's spelling wins where the two overlap: it is the curated source.
     terms: dict[str, list[str]] = {term: list(aliases) for term, aliases in SEED_TECH.items()}
     by_key = {canonicalize.tech_key(t): t for t in terms}
     added = 0
+    shadowed: list[tuple[str, str]] = []
     for term in apollo:
         key = canonicalize.tech_key(term)
+        if key in alias_owner:
+            # THE INVARIANT: this phrase is already spoken for as an alias, so it must NOT become
+            # a term of its own. Skipping it here is what makes the alias reachable at all.
+            shadowed.append((term, alias_owner[key]))
+            continue
         if key not in by_key:
             terms[term] = []
             by_key[key] = term
             added += 1
     print(f"union                                       : {len(terms)} terms ({added} new from Apollo)")
+    print(f"Apollo values skipped as declared aliases   : {len(shadowed)}")
+    for term, owner in shadowed:
+        print(f"    {term!r} is an alias of {owner!r} — no standalone term")
 
     existing = {row["term"] for row in repository.fetch_tech_canonical(conn)}
     todo = list(terms) if reseed else [t for t in terms if t not in existing]
-    if not todo:
-        print("tech_canonical already seeded; nothing to embed.")
-        return
 
     # Embed the term itself: stage 3's NN step compares a raw term against these vectors.
-    vectors = await embed.embed_texts(todo)
-    repository.upsert_tech_canonical(
-        conn, [(term, vector, terms[term]) for term, vector in zip(todo, vectors)]
-    )
-    print(f"seeded + embedded {len(todo)} terms into tech_canonical")
+    # Only new terms need a vector; `upsert_tech_canonical` COALESCEs, so an existing term
+    # re-upserted with NULL keeps the embedding it already has and costs nothing.
+    vectors = await embed.embed_texts(todo) if todo else []
+    embedded = dict(zip(todo, vectors))
+
+    # Write the alias list for EVERY seeded term, not just the ones being embedded.
+    # This used to ride along with the embed call, so a seed alias added to a term that already
+    # existed was silently dropped on the floor — the alias list only ever landed on a term's
+    # first sighting. That is how `ECC` would have ended up owned by nobody the moment it moved
+    # from `SAP` to `SAP ECC`: SAP ECC already existed as an Apollo term, so it was not in `todo`,
+    # so its new alias was never written. Seeding is a declaration, not a side effect of embedding.
+    rows = [(term, embedded.get(term), terms[term]) for term in dict.fromkeys([*todo, *SEED_TECH])]
+    repository.upsert_tech_canonical(conn, rows)
+    print(f"seeded {len(rows)} term(s) ({len(todo)} newly embedded, {len(SEED_TECH)} hand-seeded "
+          f"alias lists re-asserted)")
+    return alias_owner, terms
+
+
+def reconcile(conn, alias_owner: dict[str, str]) -> None:
+    """Make the DATABASE obey THE INVARIANT. Idempotent; a no-op once it holds.
+
+    `seed` alone cannot do this. `upsert_tech_canonical` merges alias lists *additively* (by
+    design — the ladder's `add_tech_alias` learns aliases at ingest and they must survive a
+    re-seed), so deleting `"SAP ECC"` from SEED_TECH's `SAP` entry does not delete it from the
+    row. Nothing here is hand-listed: the seed says which side of each collision yields, and
+    these two passes carry it out.
+    """
+    rows = repository.fetch_tech_canonical(conn)
+
+    # --- MERGE: a term the seed declares to be another term's alias must not exist -----------
+    doomed = [
+        row["term"] for row in rows
+        if alias_owner.get(canonicalize.tech_key(row["term"]), row["term"]) != row["term"]
+    ]
+    if doomed:
+        for term in doomed:
+            print(f"    MERGE: dropping term {term!r} -> alias of "
+                  f"{alias_owner[canonicalize.tech_key(term)]!r}")
+        repository.delete_tech_terms(conn, doomed)
+    print(f"reconcile: {len(doomed)} merged term(s) deleted from tech_canonical")
+
+    # --- SPLIT: an alias that collides with a SURVIVING term is pruned off the claimant -------
+    # After the pass above, no surviving term is a declared alias — so any alias still colliding
+    # with a term is one the seed has stopped claiming (a SPLIT), or one the seed has repointed
+    # somewhere else (`ECC`: SAP -> SAP ECC). Either way the term wins and the stale alias goes.
+    rows = repository.fetch_tech_canonical(conn)
+    survivors = {canonicalize.tech_key(row["term"]): row["term"] for row in rows}
+    updates: list[tuple[str, list[str]]] = []
+    for row in rows:
+        term = row["term"]
+        aliases = list(row["aliases"] or [])
+        keep: list[str] = []
+        for alias in aliases:
+            key = canonicalize.tech_key(alias)
+            clash = survivors.get(key)
+            if clash is not None and clash != term:
+                print(f"    SPLIT: pruning alias {alias!r} off {term!r} — {clash!r} is its own term")
+                continue
+            owner = alias_owner.get(key)
+            if owner is not None and owner != term:
+                print(f"    REPOINT: pruning alias {alias!r} off {term!r} — seed gives it to {owner!r}")
+                continue
+            keep.append(alias)
+        if keep != aliases:
+            updates.append((term, keep))
+    if updates:
+        repository.set_tech_aliases(conn, updates)
+    print(f"reconcile: {len(updates)} term(s) had stale aliases pruned")
+
+
+def verify_invariant(conn) -> None:
+    """THE INVARIANT, asserted against the database. The bug cannot come back past this line."""
+    collisions = repository.tech_alias_collisions(conn)
+    if collisions:
+        listing = "\n".join(
+            f"    {row['term']!r} is a canonical term AND an alias of {row['owner']!r}"
+            for row in collisions
+        )
+        raise SeedContradiction(
+            f"THE INVARIANT IS BROKEN in tech_canonical — {len(collisions)} collision(s):\n"
+            f"{listing}\n"
+            f"  A phrase that is both a term and another term's alias is unreachable by alias: "
+            f"the ladder tries exact first. Fix SEED_TECH, do not patch the table."
+        )
+    print("INVARIANT: 0 collisions — no term is an alias of another term. PASS")
 
 
 async def canonicalise_signals(conn) -> None:
@@ -238,7 +463,15 @@ def report(conn) -> None:
 
 async def run(args: argparse.Namespace) -> int:
     with repository.connect() as conn:
-        await seed(conn, reseed=args.reseed)
+        alias_owner, _ = await seed(conn, reseed=args.reseed)
+        print()
+        # Order matters: reconcile BEFORE canonicalise_signals. Deleting the merged standalone
+        # terms is what lets the ladder below fall through to the alias step, and that fall-
+        # through IS the data migration — `Amazon AWS` on a stored row stops matching a term of
+        # its own and resolves to `AWS`. Every stored technology is already a catalogued term, so
+        # the whole pass is exact/alias hits: no embeddings, no LLM, no cost.
+        reconcile(conn, alias_owner)
+        verify_invariant(conn)
         print()
         await canonicalise_signals(conn)
         if not args.skip_industry:

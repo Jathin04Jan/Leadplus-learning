@@ -332,6 +332,14 @@
               {% for t in e.matched_terms %}<span class="tag hit">✓ {{ t }}</span>{% endfor %}
             </div>
             <p class="job-para">{{ e.paraphrase }}</p>
+            {# The finer grain (job_intent). The paraphrase says what the posting IS; these say
+               what it is evidence OF, and an intent-phrased query ranks partly on them — so
+               hiding them would leave part of the ranking unexplained on the card. #}
+            {% if e.intents %}
+              <p class="job-intents">
+                {% for i in e.intents %}<span class="tag intent">{{ i }}</span>{% endfor %}
+              </p>
+            {% endif %}
           </div>
         {% endfor %}
       </div>

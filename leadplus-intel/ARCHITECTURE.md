@@ -38,25 +38,87 @@ company attributes, not hiring narratives.
 
 **We rebuild search over that discarded signal.**
 
-### LOCAL DEVIATION — read this before trusting any number in this spec
+### THE CORPUS IS NOW REAL — and it invalidates several premises below
 
-This repo runs against a **synthetic replica**, not the real `leadplus_dev` restore the spec assumes.
-See `README.md`. Concretely:
+**Superseded:** the synthetic-replica deviation table that stood here. `leadplus_local` is now a
+verified 1:1 clone of `leadplus_dev` (72 tables, 244,659 rows). Re-measured:
 
-| Spec assumes | Reality here |
+| Spec assumed | Real corpus |
 |---|---|
-| 22,126 jobs / 23,062 companies | **386 active jobs / 301 companies** |
-| `lead_query` COMPANY_INDUSTRY = 16,870 | **13 rows** |
-| copy-on-write populated | **0 shared rows** — the §5.4 fold is a confirmed **no-op** |
-| job ads ~70% boilerplate | descriptions are signal-dense (avg 659 chars, 100% enriched) |
-| ingest $20–40 / ~2h | **cents / ~2 min** |
-| `lead_company_job_intent` exists (125 rows) | **does not exist** |
+| 22,126 jobs / 23,062 companies | 22,251 jobs (**13,082 active**) / 23,063 companies (**22,966 active**) |
+| job ads carry text | **only 2,886 active jobs have a description >200 chars** — ~78% are stubs |
+| `posted_date` populated | **125 of those 2,886.** The recency axis is mostly dead. Scraper gap. |
+| copy-on-write duplication (2–3×) | **barely populated** — 28 tenant rows total. See §5.4's note. |
+| `lead_query` COMPANY_INDUSTRY = 16,870 | **91 rows** |
+| ingest $20–40 / ~2h | **$3.79 / ~2.5h** for 2,886 jobs + 487 companies |
+| `lead_company_job_intent` (125 rows) | **exists, 451 rows** — another team's. See §5.8. |
 
-The §15 gates were run and **cannot validate the thesis** — they replay the seed. This build proves
-the *architecture* works and the three defects are fixed. It does **not** prove job-intent is a
-product; that needs the real corpus (still blocked: the `anjali` credential has zero table grants).
+**The premise this most damages — read before writing a prompt or reading a result:**
 
-Every §4 design rule holds *more* strongly at 690 documents, not less.
+> **This corpus is not manufacturing.** Of the 2,886 extractable postings:
+> **49% Hospitals and Health Care**, 15% Retail, 13% Financial Services, 7% Transportation &
+> Logistics — and **7% manufacturing/industrial across all variants combined.**
+
+Every example in §1, §5.2 and §9 is a manufacturer migrating SAP ECC. That describes **7%** of
+what the pipeline actually reads. The thesis (job postings are buying signals) is unaffected —
+a hospital modernizing its revenue cycle is exactly as much of a signal as a plant migrating its
+ERP — but the *vocabulary*, the *examples* and the *golden set* were all built for the wrong
+domain, and `prompts/job_normalizer.md` v6 had to be corrected accordingly (it told the model it
+was reading manufacturing postings; it is mostly not).
+
+Consequences already realised:
+* `evals/golden.yaml` is **dead** — its labels are synthetic company ids that now point at real
+  companies chosen at random. `scripts/eval.py` hard-fails rather than score it.
+* The corpus is **multilingual** (German is common).
+
+### ⚠️ The clone contains seeded demo data, and it is load-bearing in the worst way
+
+`leadplus_dev` carries **25 fabricated companies** — `tenant_id = 29`, names prefixed
+`Synthetic `, domains ending `.example` (RFC 2606, reserved and unresolvable). They own **125 of
+the 2,886 extractable postings (4.3%)**, and their descriptions are one ERP template:
+
+> *"Synthetic Northstar Components is hiring an ERP Transformation Program Manager to coordinate
+> a multi-year review of the systems supporting its manufacturing operations… document the
+> current SAP ECC landscape…"*
+
+**Two things follow, and both matter more than the 4.3% suggests.**
+
+**1. `posted_date` is 100% synthetic within the indexed corpus. The recency axis is not "mostly
+dead" — it is dead, and what remains alive is fiction.**
+
+```
+extractable postings (desc > 200 chars) with a posted_date : 125
+   ... belonging to synthetic companies                    : 125
+   ... belonging to real companies                         :   0     <-- ZERO
+```
+
+Real dated postings do exist (22 active, 62 total) — but **not one of them carries a description
+over 200 chars**, so not one is extractable. So every non-NULL `job_signal.posted_date` in this
+index belongs to a company that does not exist.
+
+The consequence is a silent, confident lie: **any query with `since_days` can only return
+synthetic companies**, because they are the only rows that can pass a date filter. "Manufacturers
+hiring for SAP in the last quarter" returns a ranked list of fictions, with evidence and
+paraphrases, at high confidence. That is precisely the failure mode this project exists to end.
+
+It also means the **thesis is currently unprovable on this data**. §0's wedge is *"a company
+posting this six days ago is actively investing"* — recency of hiring signal. Zero real postings
+carry a date. `HIRING` mode weights `recency` at **0.40**, its largest single weight; on real data
+that term is 0.0 for every company. This is **not a scraper gap to be waved at** — it is the
+finding: the scraper has never once captured a date on a posting it also captured text for.
+
+**2. The other team's `lead_company_job_intent` describes ONLY these 25 fictions.**
+All 451 rows, all 92 jobs, all 25 companies — every one `.example`. See §5.8.
+
+**Neither is patched here.** The 2,886 are ingested as briefed, synthetic rows included, because
+the honest move is to surface this rather than quietly drop rows and report a clean number. They
+are trivially identifiable (`lead_company.domain LIKE '%.example'` / `tenant_id = 29`), so
+excluding them is a one-line predicate in `fetch_jobs_to_normalize` — but whether demo data
+belongs in `leadplus_dev` at all is a decision for whoever put it there, not a thing to paper
+over in a derived index.
+
+This build proves the architecture and the three defects are fixed. Whether job-intent is a
+*product* is now answerable on real data for the first time — but not from this document.
 
 ---
 
@@ -181,10 +243,105 @@ Each of these exists because violating it is what broke the current system.
 5. **Enums where closed, canonicalise where long-tail.** Free-texting technologies gives you
    `SAP S/4HANA`, `S/4 HANA`, `SAP S4`, `S4/HANA` — and you're back to substring matching.
 
+   > **This rule is about NAMED PRODUCTS. It does not say "canonicalise everything long-tail",
+   > and reading it that way cost us a table.** The example above is a technology, and that is
+   > load-bearing: `SAP S/4HANA` and `SAP S4` are one thing *with an official form*, so
+   > canonicalising **recovers** an identity that already exists. A **descriptive phrase** has no
+   > official form — `icd-10 coding accuracy`, `embedded electronics design` — so canonicalising
+   > it **invents** one.
+   >
+   > We applied this rule to `job_intent` anyway. Measured: **5,209 distinct phrases in 8,114
+   > rows** (nearly every intent unique), **3.9% resolved**, nearest-match similarities
+   > **0.32–0.52**, and a **5,195-row review queue of things that were never broken**. The column
+   > and both vocabulary tables were **removed**; intents are matched semantically via
+   > `intent_embedding`. See §5.8. **`tech_canonical` stays** — it is the case this rule is for,
+   > and its ladder catches real traps (`ROS`→`ROSS` @ 0.79).
+   >
+   > The test before canonicalising anything new: **does this thing have an official name?** If
+   > yes, canonicalise. If it is a description, embed it.
+
+   > ### ⚠️ THE INVARIANT — a vocabulary must not contradict itself
+   >
+   > **No phrase may be both a canonical term and an alias of a different term.**
+   >
+   > Enforced in `scripts/bootstrap_tech.py` (`_alias_owners` fails the run on a self-contradictory
+   > `SEED_TECH`; `reconcile` makes the table obey it; `verify_invariant` asserts zero collisions
+   > afterwards) and mirrored in `score.py`'s `TermMatcher`. It is not a style rule — violating it
+   > broke this vocabulary in **both directions at once**, and neither failure raised anything.
+   >
+   > **How it happened.** `tech_canonical` is built from two sources that disagree: the hand-seeded
+   > `SEED_TECH` (`"AWS": ["Amazon Web Services", "Amazon AWS"]`, `"SAP": ["SAP ERP", "SAP ECC",
+   > "ECC", "SAP R/3"]`) **union** the ~4,529 distinct values of Apollo's
+   > `lead_company.technologies[]` — which carry `Amazon AWS` and `SAP ECC` **as values of their
+   > own**. So 19 phrases ended up as both a term and someone else's alias. The stage-3 ladder
+   > tries **exact before alias**, so each one matched its own standalone term and *never reached
+   > the alias step*. The alias was dead code that looked like configuration.
+   >
+   > **Measured, before the fix:**
+   >
+   > ```
+   > fragmentation: 65 companies use AWS -> 40 stored as `Amazon AWS`, 25 as `AWS`, ZERO overlap.
+   >                A live search for AWS returned 25 of 65. The other 40 were invisible.
+   > conflation:    query `SAP ECC` resolved to canonical `SAP`. Top 5 showed coverage=1.00 and
+   >                NOT ONE carried SAP ECC. The 20 companies that genuinely run ECC matched
+   >                nothing.
+   > ```
+   >
+   > Read those together: the same defect **split one product into two** and **merged two products
+   > into one**, silently, at once. Both are rule 5's own failure mode — `SAP S/4HANA` vs `SAP S4`
+   > — reappearing one layer up, in the vocabulary that exists to prevent it.
+   >
+   > **The seed is the classification, and it is the only place to look.** Declaring a phrase as an
+   > alias means MERGE (the standalone term is deleted and its rows migrate to the owner: same
+   > product). Not declaring it means SPLIT (the standalone stands alone and the stale alias is
+   > pruned off whoever claimed it: different product). `bootstrap_tech.py` reads that decision and
+   > carries it out; nothing is hand-listed.
+   >
+   > **The SAP ruling, because it is the product question.** `SAP` is the vendor/generic; `SAP ECC`,
+   > `SAP ERP` and `SAP R/3` are the legacy on-prem products; `SAP S/4HANA` is the modern successor.
+   > These are **not** spellings of one thing, so they are SPLIT — and Apollo agrees, since 2
+   > companies carry ECC *and* ERP, which is only possible if they are different attributes. On this
+   > corpus SAP=10, SAP ECC=20, SAP ERP=6, S/4HANA=1 — four different sets. §0's wedge is *"who is
+   > still on ECC and therefore has a migration ahead of them?"*; folding ECC into SAP destroys the
+   > only question this tool exists to ask, which is why the conflation above was worse than a wrong
+   > answer — it was a confident one. (The bare acronym `ECC` belongs to `SAP ECC`, not to `SAP`.)
+   >
+   > **Honest footnote on the SAP ECC result:** all 20 ECC companies are the seeded `.example`
+   > fictions of §0. The fix is still correct and necessary — it replaced five confidently wrong
+   > answers with correct ones — but on *this* corpus a SAP ECC query can only return demo data, for
+   > the same reason `since_days` can (§0). The AWS half is real: of the 65, **45 are real
+   > companies**, and 40 of the 65 were unreachable before.
+   >
+   > **The guard must use the ladder's own key.** A string-equality collision check finds 18 and
+   > misses the 19th — `Oracle E Business Suite` vs the alias `Oracle E-Business Suite`, which differ
+   > only by punctuation `tech_key` strips. `repository.tech_alias_collisions` compares on
+   > `tech_key`, because a guard that parses its input differently from the thing it guards is not a
+   > guard (`config.assert_local_database` learned this the same way).
+
 6. **No chunking.** A job ad is 2–5KB and already the natural unit.
 
 7. **No ANN index.** Exact brute-force cosine over the filtered set is faster *and more accurate* at
    this size. ANN composes badly with pre-filters. Revisit at ~1M rows.
+
+   > **Two updates from the real corpus, and the second is a warning.**
+   >
+   > **(a) The rule is now enforced by pgvector, not by discipline.** At `vector(3072)` an ANN
+   > index is not merely inadvisable, it is impossible — verified:
+   > ```
+   > CREATE INDEX ... USING hnsw    -> ERROR: column cannot have more than 2000 dimensions
+   > CREATE INDEX ... USING ivfflat -> ERROR: column cannot have more than 2000 dimensions
+   > ```
+   >
+   > **(b) "Revisit at ~1M rows" is the wrong trigger. Watch BYTES, not rows.** A `vector(3072)`
+   > row is ~12KB, so `job_intent` reached **20MB at 500 jobs** and the six-list `/structured`
+   > path already measured **retrieve_ms ≈ 77 (total 122ms)** — over §6's <100ms budget, at 17%
+   > of the corpus. The budget is broken long before 1M rows, because the 3072 switch doubled the
+   > bytes per vector and `job_intent` added ~3–5 vectors per job on top.
+   >
+   > This is a real cost of §5.8's decision, and it has no easy exit: the usual escape (an ANN
+   > index) is the thing (a) just made illegal. The honest options are to halve the dims (losing
+   > the cross-source comparability that motivated 3072), pre-filter harder before the scan, or
+   > accept a slower `/structured`. **Do not "solve" it by reaching for an index — measure first.**
 
 8. **No Elasticsearch.** A second datastore that can silently drift from Postgres.
 
@@ -251,8 +408,14 @@ raw term "SAP S/4 HANA"
 **Bootstrap `tech_canonical`** from the distinct values in `lead_company.technologies[]` (Apollo's
 list is curated) plus a hand-seeded list of SI-relevant platforms.
 
-**Stage 4 — Embed.** `text-embedding-3-small`, 1536 dims, on the **paraphrase only** — never the raw
-description. Batch 100 texts per call.
+**Stage 4 — Embed.** `text-embedding-3-large`, **3072 dims**, on the **paraphrase only** (and on each
+intent phrase, §5.8) — never the raw description. Batch 100 texts per call.
+
+3072, not 1536/-small, so that ONE query vector compares against `job_signal`, `company_signal`
+AND `job_intent` — including the other team's 3072-dim table if the two are ever UNIONed. Two
+dimensionalities would mean two query embeds and no cross-source cosine. Note this also makes
+rule 7 mandatory rather than merely correct: pgvector's ivfflat/hnsw cap at 2000 dims and would
+refuse the index anyway.
 
 **Stage 5 — Load.** Single upsert keyed on `job_id`, so a crash mid-batch leaves no partial rows.
 
@@ -276,7 +439,35 @@ unioning `technologies[]`/`keywords[]`/`scraped_*` across all `member_ids`.
 
 **Verify:** `count(*) FROM company_canonical` should be **less** than `count(*) FROM lead_company
 WHERE active`. If equal, copy-on-write isn't populated in this restore and the fold is a no-op —
-**fine, but confirm rather than assume.** (Here: it *is* a no-op. Confirmed.)
+**fine, but confirm rather than assume.**
+
+**MEASURED ON THE REAL CORPUS — the fold works, but not for the reason this section gives.**
+
+```
+active lead_company rows : 22,966
+canonical companies      : 22,901      -> 65 rows collapsed, across 60 domain groups
+```
+
+So it is **no longer a no-op** (it was, on synthetic). But the premise above is still mostly
+wrong: **copy-on-write is barely populated** — only 28 of 22,966 active rows carry a
+`tenant_id`, and of the 60 multi-member groups, **58 are duplicate SHARED rows** (two
+`tenant_id IS NULL` rows, same domain) and only **2** are the shared+tenant pattern §5.4
+describes. The fold is catching plain duplicate companies, not copy-on-write.
+
+It still earns its place, and here is the whole of its effect on the working set — one company:
+
+```
+1476  Berkeley Bowl Produce Inc.   berkeleybowl.com   10 text-bearing jobs
+1477  Berkeley Bowl Marketplace    berkeleybowl.com   10 text-bearing jobs
+```
+
+One real grocer, scraped twice under two names. Without the fold it is indexed twice, ranks
+twice, and its 20 postings look like two companies' worth of hiring. With it: canonical 1476,
+`member_ids [1476, 1477]`, 10 jobs remapped. **488 text-bearing companies -> 487.**
+
+That is a small win, honestly reported: the fold prevents one visible duplicate here. Keep it —
+it is cheap, it is correct, and the duplication it catches is real — but do not cite §5.4's
+"indexed 2–3×" as a reason it matters on this data. It isn't true here.
 
 ### 5.5 Industry canonicalisation
 
@@ -301,6 +492,110 @@ within 90 days **and** paraphrase cosine > 0.95. MVP shortcut: `volume` counts `
 | Cost control | `--limit N` and `--dry-run`. **Always sample before the full run.** |
 | Prompt versioning | `prompt_version` in every row. Changing a prompt is a data migration. |
 
+### 5.8 The intent grain — adopted from another team (`job_intent`)
+
+Another team at Limark built `lead_company_job_intent` (451 rows, 92 jobs, 25 companies). Their
+extraction grain is **better than ours in one respect and we adopted it**: ~5 short intent
+phrases per job (`erp transformation program`, `sap ecc to snowflake pipelines`) instead of our
+single paraphrase. Their vectors are 3072-dim (`text-embedding-3-large`), which is why §5.2
+stage 4 and the whole schema moved to 3072.
+
+> **⚠️ Their 451 rows describe ZERO real companies.** All 25 of the companies they cover are the
+> seeded fictions from §0: `tenant_id = 29`, `Synthetic *`, `.example` domains. Checked directly:
+>
+> ```
+> their companies: 25 | name LIKE 'Synthetic %': 25 | domain LIKE '%.example': 25
+> ```
+>
+> This does **not** retract the grain — see below — but it retracts every *measurement* offered
+> in support of it. "Verified description-driven, not title-templated: 25 same-title jobs produced
+> 11 distinct intent-sets" was measured against **generated** descriptions from one ERP template.
+> It shows the extractor varies its output when a generator varies its input. It does not show
+> the grain survives a real job ad, and it cannot: their extractor has never read one.
+>
+> It also fully explains §5.8's resolution result below. Their vocabulary does not fail to
+> transfer because our corpus is *different* from theirs; it fails because **theirs is not a
+> corpus.**
+
+**The grain is still right, and it is adopted on its own evidence, not theirs.** The 25-row gate
+(§13 phase 3) ran it against real postings — healthcare coders, German apprenticeships, robotics
+engineers — and it held: intent-sets tracked the descriptions, same-title jobs diverged, and
+postings that named no work correctly returned an empty list. That is the evidence for the
+decision. Their table was the *idea*; the real corpus was the test.
+
+Adopting 3072 dims is likewise justified on its own merits (one query vector across
+`job_signal`/`company_signal`/`job_intent`) — and NOT by "matching theirs", which is matching a
+table built on fiction.
+
+**We keep the paraphrase.** It is the UI evidence line and the product (§1). The two are
+different grains, not competitors: a paraphrase *explains* a company to a salesperson; an intent
+phrase *matches* a query that names an initiative. **One LLM call emits both** — they are two
+readings of one document, so a second call would pay twice and let the readings disagree.
+
+**What we add: provenance.** Their table has none (`id, job_id, intent, intent_embedding,
+created_at, updated_at`), so it cannot say which rows came from which prompt or model, or whose
+they are. `job_intent` carries `prompt_version`, `model` and `source` — which makes a UNION of
+the two tables safe, and makes a bad prompt version findable and re-runnable (§5.7's key).
+
+**`lead_company_job_intent` is THEIRS. Read-only, like `lead_company*`. Never write it.**
+
+### ⛔ INTENTS ARE NOT CANONICALISED — the category error, and its removal
+
+**This was built, measured, and removed. Do not re-add it.** `intent_canonical` (the column and
+the table), `intent_review_queue`, the 80-phrase seed from the other team and the intent ladder
+are **gone**. What follows is why, so nobody rebuilds them from rule 5.
+
+**The error was reading rule 5 as "canonicalise everything long-tail".** It says *enums where
+closed, **canonicalise where long-tail*** — and its worked example is a **technology**. That is
+the whole distinction:
+
+* A **technology is a named product.** `SAP S/4HANA` / `S/4 HANA` / `SAP S4` really are one thing
+  with an official form. Snapping them together is *recovering* an identity that exists.
+  `tech_canonical` is correct and load-bearing — keep it.
+* An **intent is a descriptive phrase.** `icd-10 coding accuracy`, `drg assignment validation`,
+  `embedded electronics design`. **There is no official form to snap to.** Canonicalising it is
+  *inventing* an identity that does not exist.
+
+Applying the technology ladder to intents was a **category error**, and the corpus said so:
+
+```
+job_intent                  : 8,114 rows / 5,209 DISTINCT phrases  <- nearly every intent unique
+resolved by the ladder      :   317 (3.9%)          NULL: 7,797
+intent_review_queue         : 5,195 rows of things that were NEVER BROKEN
+nearest-match similarities  : 0.32 - 0.52  -- correctly nowhere near the 0.85 threshold
+    icd-10 coding accuracy   -> record-to-report documentation      0.318
+    personal care services   -> cost quality continuity partnership 0.328
+    patient care delivery    -> delivery plan management            0.538  (shares one word)
+```
+
+Read the shape of that: **5,209 distinct phrases in 8,114 rows.** A vocabulary is worth having
+when many observations collapse onto few terms. Here almost nothing repeats, so there is nothing
+to collapse — the ladder could only ever refuse (correctly, 96.1% of the time) or force a
+resemblance into an identity. The 5,195-row review queue was the tell: **a queue of things that
+were never broken**, asking a human to "fix" phrases that were already exactly right.
+
+**The other team was right.** Their `lead_company_job_intent` is `id, job_id, intent,
+intent_embedding, created_at, updated_at` — **no canonical column at all.** They did not make
+this mistake, and adopting their grain (§5.8) should have included adopting its shape.
+
+**How intents are matched: semantically, via the 3072-dim `intent_embedding`.** That is what the
+vector is for, and it is why the removal costs nothing — retrieval never read `intent_canonical`.
+`icd-10 coding accuracy` and `icd-10 coding compliance` are near neighbours *in the embedding
+space*, which is the correct place to express "these are similar" — because it says **similar**,
+with a number, rather than asserting they are the same thing. A canonical column can only say
+"identical" or "unknown", and for a descriptive phrase both are usually wrong.
+
+**The nearest-miss list above is not an argument for a review queue — it is an argument against
+the column.** Forcing `patient care delivery` onto `delivery plan management` would be a
+resemblance promoted to an identity: defect #2 of the system this project replaces, rebuilt
+inside the replacement, in the one place nobody would look. The way to never do that is to not
+keep a vocabulary that a future threshold tweak could make it do.
+
+`job_intent` is therefore **their exact shape plus our provenance**: `id, job_id, company_id,
+intent, intent_embedding, prompt_version, model, source, created_at, updated_at`. The provenance
+is the part worth adding (a UNION with theirs stays attributable, a bad prompt version stays
+findable). The canonical column was not.
+
 ### 5.9 Provisional enums
 
 Validate against real jobs before the full run — a starting hypothesis, not truth.
@@ -324,7 +619,8 @@ Target **< 100ms** excluding the LLM parse. Everything after the parse is determ
    [1] PARSE — LLM, cacheable → chips { terms[], industry, since_days, ... }  ← editable in UI
    [2] HARD FILTERS — facts only, in SQL (posted_date, employee_range, revenue)
    [3a] LEXICAL ts_rank top 200   ‖   [3b] SEMANTIC exact cosine top 200   (same survivor set)
-   [4] project jobs→companies, then RRF Σ 1/(60+rank) over 4 company-level lists
+        over job_signal, job_intent (§5.8) AND company_signal -> SIX lists
+   [4] project jobs→companies, then RRF Σ 1/(60+rank) over 6 company-level lists
    [5] COVERAGE per company (terms matched, by Term.source)
    [6] AGGREGATE → companies + evidence
 ```
@@ -355,8 +651,11 @@ class Chips(BaseModel):
 **normalized query paraphrase**, not the raw string (rule 4). Run both against `company_signal` too
 (no date filter — companies have no `posted_date`).
 
-**[4] Fuse.** Project the job lists to companies *first* (best job's rank wins), then RRF the four
-company-level lists. RRF fuses *ranks*, so `ts_rank` and cosine never have to be made commensurable.
+**[4] Fuse.** Project the job lists to companies *first* (best job's rank wins), then RRF the six
+company-level lists. RRF fuses *ranks*, so `ts_rank` and cosine never have to be made commensurable
+— which is also why adding `job_intent` as a source (§5.8) needed no re-weighting and no tuning:
+a new list contributes 1/(60+rank) like every other. The intent lists dedup to the best-ranked row
+per job before projecting, so a job with five matching phrases is still one job.
 
 **[5] Coverage** by `Term.source`, in Python over ~300 candidates. **Terms never filter.**
 
@@ -389,7 +688,7 @@ CREATE TABLE job_signal (
   title_norm       text,
   is_repost        boolean DEFAULT false,
   tsv              tsvector GENERATED ALWAYS AS (to_tsvector('english', paraphrase)) STORED,
-  embedding        vector(1536),         -- NO index. See rule 7.
+  embedding        vector(3072),         -- NO index. See rule 7.
   posted_date      timestamp,
   prompt_version   text NOT NULL,
   model            text NOT NULL,
@@ -405,9 +704,9 @@ CREATE TABLE company_signal (
   technologies       text[],
   industry_raw       text,
   industry_canonical text,
-  industry_embedding vector(1536),
+  industry_embedding vector(3072),
   tsv                tsvector GENERATED ALWAYS AS (to_tsvector('english', paraphrase)) STORED,
-  embedding          vector(1536),
+  embedding          vector(3072),
   prompt_version     text NOT NULL,
   model              text NOT NULL,
   run_at             timestamptz DEFAULT now()
@@ -417,7 +716,7 @@ CREATE INDEX ON company_signal (industry_canonical);
 
 CREATE TABLE tech_canonical (
   term      text PRIMARY KEY,
-  embedding vector(1536),
+  embedding vector(3072),
   aliases   text[]
 );
 
@@ -428,6 +727,34 @@ CREATE TABLE tech_review_queue (
   occurrences int DEFAULT 1,
   resolved_to text
 );
+
+-- §5.8 — the finer grain, adopted from lead_company_job_intent, PLUS the provenance it lacks.
+-- Their shape is (id, job_id, intent, intent_embedding, created_at, updated_at) and cannot say
+-- whose rows are whose. Ours can, so a UNION with theirs is safe.
+-- NO intent_canonical column: an intent is a descriptive phrase, not a named product (§5.8).
+-- 5,209 distinct phrases / 8,114 rows, 3.9% resolved, sims 0.32-0.52. Matched via the embedding.
+-- This is THEIR shape (id, job_id, intent, intent_embedding, created_at, updated_at) PLUS our
+-- provenance (company_id, prompt_version, model, source) — so a UNION is attributable.
+CREATE TABLE job_intent (
+  id               bigserial PRIMARY KEY,
+  job_id           bigint NOT NULL,
+  company_id       bigint NOT NULL,     -- ALWAYS company_canonical.canonical_id
+  intent           text NOT NULL,       -- as extracted; the phrase IS the record
+  intent_embedding vector(3072),        -- NO index. Rule 7. This is how an intent is matched.
+  prompt_version   text NOT NULL,
+  model            text NOT NULL,
+  source           text NOT NULL DEFAULT 'leadplus-intel',
+  created_at       timestamptz DEFAULT now(),
+  updated_at       timestamptz DEFAULT now()
+);
+CREATE UNIQUE INDEX ON job_intent (job_id, intent, prompt_version, model);  -- §5.7's key
+CREATE INDEX ON job_intent (job_id);
+CREATE INDEX ON job_intent (company_id);
+CREATE INDEX ON job_intent USING gin (to_tsvector('english', intent));
+
+-- There is deliberately NO `intent_canonical` and NO `intent_review_queue` table. They existed,
+-- were measured (§5.8) and were dropped. `tech_canonical`/`tech_review_queue` above are NOT the
+-- precedent for re-adding them: a product has an official name; a description does not.
 ```
 
 **Never `ALTER` or write to `lead_company*`.**
@@ -558,7 +885,7 @@ Response carries `chips` (editable in the UI), ranked `companies` with `score`, 
 ## 11. Stack
 
 Python 3.12 · `uv` · FastAPI · pydantic v2 · **psycopg 3, raw SQL, no ORM** · openai
-(`gpt-4.1-mini` normalize+parse, `text-embedding-3-small` 1536) · pgvector · Jinja2 + HTMX.
+(`gpt-4.1-mini` normalize+parse, `text-embedding-3-large` 3072) · pgvector · Jinja2 + HTMX.
 
 **`repository.py` is the seam.** Every raw query behind a narrow interface, so the source can swap
 from this restore to a real one with nothing above it changing.

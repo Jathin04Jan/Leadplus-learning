@@ -6,8 +6,11 @@ SQL, explicit column lists, no ORM.
 
 Read/write discipline (§2, §7):
   * `lead_company`, `lead_company_job`, `lead_query` are READ-ONLY. Nothing here writes them.
+  * `lead_company_job_intent` is READ-ONLY and belongs to ANOTHER TEAM. We read it to seed the
+    intent vocabulary and to compare coverage; we never write it. Our equivalent is `job_intent`,
+    which is the same shape plus the provenance columns theirs lacks.
   * We write only our own derived tables: company_canonical, job_signal, company_signal,
-    tech_canonical, tech_review_queue, ingest_dead_letter.
+    job_intent, tech_canonical, tech_review_queue, location_alias, ingest_dead_letter.
 
 pgvector note: `pgvector-python` is not installed, so vectors cross the wire as their text
 literal (`'[0.1,0.2,...]'`) with an explicit `::vector` cast. `_vec()` is the single place that
@@ -23,10 +26,25 @@ import psycopg
 from psycopg.rows import dict_row
 
 from . import config
-from .models import CanonicalCompany, CompanySignalRow, CompanySource, JobSignalRow, JobSource
+from .models import (
+    CanonicalCompany,
+    CompanySignalRow,
+    CompanySource,
+    JobIntentRow,
+    JobSignalRow,
+    JobSource,
+)
 
 # Tables we are forbidden from writing. Asserted by `assert_read_only_respected()`.
-LEADPLUS_TABLES = ("lead_company", "lead_company_job", "lead_query", "lead_contact")
+# `lead_company_job_intent` is on this list because it is another team's table, not because it is
+# LeadPlus core — the discipline is the same either way: read it, never write it.
+LEADPLUS_TABLES = (
+    "lead_company",
+    "lead_company_job",
+    "lead_query",
+    "lead_contact",
+    "lead_company_job_intent",
+)
 
 
 def _vec(values: Sequence[float] | None) -> str | None:
@@ -68,6 +86,7 @@ def health(conn: psycopg.Connection) -> dict[str, Any]:
     for table in (
         "company_canonical",
         "job_signal",
+        "job_intent",
         "company_signal",
         "tech_canonical",
         "tech_review_queue",
@@ -258,11 +277,16 @@ def fetch_jobs_to_normalize(
     model: str,
     limit: int = config.FETCH_BATCH_SIZE,
 ) -> list[JobSource]:
-    """§5.2 stage 1, verbatim: keyset pagination + the NOT EXISTS resumability clause.
+    """§5.2 stage 1: keyset pagination + the NOT EXISTS resumability clause.
 
     The NOT EXISTS is what makes this cheap to re-run and what makes a prompt bump a delta
     rather than a full re-spend. It is also the checkpoint: there is no separate checkpoint
     table because already-written rows *are* the checkpoint.
+
+    Deviation from §5.2's literal SQL: the `length(description)` gate. The spec was written
+    against an assumed corpus; on the real clone 10,196 of 13,082 active jobs are stubs with no
+    prose to normalize. See `config.MIN_DESCRIPTION_CHARS` for why they are excluded at the
+    source rather than normalized into invented signal.
     """
     rows = conn.execute(
         """
@@ -272,6 +296,7 @@ def fetch_jobs_to_normalize(
         FROM lead_company_job j
         JOIN lead_company c ON c.id = j.lead_company_id
         WHERE j.active AND c.active
+          AND length(j.description) > %(min_chars)s
           AND j.id > %(cursor)s
           AND NOT EXISTS (
             SELECT 1 FROM job_signal s
@@ -280,7 +305,13 @@ def fetch_jobs_to_normalize(
         ORDER BY j.id
         LIMIT %(limit)s
         """,
-        {"cursor": cursor, "prompt_version": prompt_version, "model": model, "limit": limit},
+        {
+            "cursor": cursor,
+            "prompt_version": prompt_version,
+            "model": model,
+            "limit": limit,
+            "min_chars": config.MIN_DESCRIPTION_CHARS,
+        },
     ).fetchall()
     return [JobSource(**{k: (v if v is not None else _default(k)) for k, v in r.items()}) for r in rows]
 
@@ -291,13 +322,33 @@ def _default(key: str) -> Any:
 
 
 def count_ingestable_jobs(conn: psycopg.Connection) -> int:
-    """The denominator for the ingest report: active jobs at active companies."""
+    """The denominator for the ingest report: active, text-bearing jobs at active companies.
+
+    Must apply the SAME predicate as `fetch_jobs_to_normalize`, or the progress report measures a
+    corpus the ingest is not walking.
+    """
     row = conn.execute(
         """
         SELECT count(*) AS n
         FROM lead_company_job j JOIN lead_company c ON c.id = j.lead_company_id
-        WHERE j.active AND c.active
+        WHERE j.active AND c.active AND length(j.description) > %(min_chars)s
+        """,
+        {"min_chars": config.MIN_DESCRIPTION_CHARS},
+    ).fetchone()
+    return row["n"]  # type: ignore[index]
+
+
+def count_text_bearing_companies(conn: psycopg.Connection) -> int:
+    """How many canonical companies have at least one text-bearing job — the §5.3 denominator."""
+    row = conn.execute(
         """
+        SELECT count(DISTINCT cc.canonical_id) AS n
+        FROM lead_company_job j
+        JOIN lead_company c ON c.id = j.lead_company_id
+        JOIN company_canonical cc ON j.lead_company_id = ANY(cc.member_ids)
+        WHERE j.active AND c.active AND length(j.description) > %(min_chars)s
+        """,
+        {"min_chars": config.MIN_DESCRIPTION_CHARS},
     ).fetchone()
     return row["n"]  # type: ignore[index]
 
@@ -323,6 +374,16 @@ def fetch_companies_to_normalize(
 
     `notes`, `account_summary` and `salesperson_name` are NEVER selected (§3, §5.3) — internal
     free-text that may contain personal data. `lead_contact` is not touched at all.
+
+    SCOPE, and it is a spend decision rather than a design one: this walks only the canonical
+    companies that have at least one text-bearing job (488), not all 22,966 active companies.
+    Indexing the full firmographic corpus is a defensible product — "companies that *use* X" is
+    half of §5.1 — but it is ~22.5k more LLM calls (~$25) that nobody has approved, and it would
+    add 22.5k companies with no job evidence to a system whose thesis is job evidence. The
+    predicate below is the only thing standing between a `--limit`-less run and that bill, so it
+    lives in the SQL, not in a caller's flag.
+
+    When that spend is approved, delete the EXISTS clause — nothing else changes.
     """
     rows = conn.execute(
         """
@@ -361,6 +422,15 @@ def fetch_companies_to_normalize(
                         unnest(m.scraped_services) AS x WHERE m.id = ANY(cc.member_ids)), '{}')     AS scraped_services
         ) u
         WHERE cc.canonical_id > %(cursor)s
+          AND EXISTS (
+            -- Only companies with job evidence. See the docstring: the other 22,478 are a
+            -- ~$25 spend that has not been approved.
+            SELECT 1 FROM lead_company_job j
+            JOIN lead_company jc ON jc.id = j.lead_company_id
+            WHERE j.lead_company_id = ANY(cc.member_ids)
+              AND j.active AND jc.active
+              AND length(j.description) > %(min_chars)s
+          )
           AND NOT EXISTS (
             SELECT 1 FROM company_signal s
             WHERE s.company_id = cc.canonical_id
@@ -369,7 +439,13 @@ def fetch_companies_to_normalize(
         ORDER BY cc.canonical_id
         LIMIT %(limit)s
         """,
-        {"cursor": cursor, "prompt_version": prompt_version, "model": model, "limit": limit},
+        {
+            "cursor": cursor,
+            "prompt_version": prompt_version,
+            "model": model,
+            "limit": limit,
+            "min_chars": config.MIN_DESCRIPTION_CHARS,
+        },
     ).fetchall()
     out: list[CompanySource] = []
     for r in rows:
@@ -477,6 +553,71 @@ def upsert_company_signals(conn: psycopg.Connection, rows: Sequence[CompanySigna
               prompt_version     = EXCLUDED.prompt_version,
               model              = EXCLUDED.model,
               run_at             = now()
+            """,
+            params,
+        )
+    return len(rows)
+
+
+def replace_job_intents(
+    conn: psycopg.Connection,
+    rows: Sequence[JobIntentRow],
+    *,
+    job_keys: Sequence[tuple[int, str, str]],
+) -> int:
+    """Load `job_intent` for a batch of jobs — one row per intent phrase.
+
+    Delete-then-insert per (job_id, prompt_version, model) rather than a bare upsert, because a
+    job's intents are a SET: a re-run of the same prompt that now emits 4 phrases where it once
+    emitted 5 must leave 4 rows, not 5 with one stale. `ON CONFLICT` alone would silently keep
+    the orphan and the set would drift with every re-run.
+
+    `job_keys` is EVERY job in the batch, not just the ones that produced intents — and that
+    distinction is the whole correctness of the delete. Deriving the delete set from `rows` (the
+    obvious shortcut) cannot express "this job now has NO intents": a job that previously emitted
+    five phrases and now emits none contributes no rows, so it would contribute no delete either,
+    and its five stale phrases would survive as evidence for an extraction that no longer says
+    them. An empty result is a result.
+
+    Scoped to OUR rows: the delete carries `prompt_version`/`model`/`source`, so it cannot reach
+    another prompt version's rows — and it physically cannot reach the other team's table, which
+    is a different table we never write.
+    """
+    if not rows and not job_keys:
+        return 0
+    # Every job in the batch is cleared, including the ones with nothing to insert.
+    keys = sorted({(job_id, pv, model, "leadplus-intel") for job_id, pv, model in job_keys})
+    params = [
+        (
+            r.job_id,
+            r.company_id,
+            r.intent,
+            _vec(r.intent_embedding),
+            r.prompt_version,
+            r.model,
+            r.source,
+        )
+        for r in rows
+    ]
+    with conn.transaction(), conn.cursor() as cur:
+        cur.executemany(
+            """
+            DELETE FROM job_intent
+            WHERE job_id = %s AND prompt_version = %s AND model = %s AND source = %s
+            """,
+            keys,
+        )
+        cur.executemany(
+            """
+            INSERT INTO job_intent (
+              job_id, company_id, intent, intent_embedding,
+              prompt_version, model, source, created_at, updated_at
+            ) VALUES (%s, %s, %s, %s::vector, %s, %s, %s, now(), now())
+            ON CONFLICT (job_id, intent, prompt_version, model) DO UPDATE SET
+              company_id       = EXCLUDED.company_id,
+              intent_embedding = EXCLUDED.intent_embedding,
+              source           = EXCLUDED.source,
+              updated_at       = now()
             """,
             params,
         )
@@ -616,6 +757,64 @@ def fetch_tech_canonical(conn: psycopg.Connection) -> list[dict[str, Any]]:
     ).fetchall()
 
 
+def delete_tech_terms(conn: psycopg.Connection, terms: Sequence[str]) -> int:
+    """Drop canonical terms outright — the MERGE half of THE INVARIANT.
+
+    A phrase declared as another term's alias must not also be a term of its own: the §5.2
+    stage-3 ladder tries exact BEFORE alias, so the standalone term shadows the alias and the
+    alias never fires. `Amazon AWS` sat here as its own term and hid 40 of 65 AWS users.
+    """
+    if not terms:
+        return 0
+    conn.execute("DELETE FROM tech_canonical WHERE term = ANY(%s::text[])", (list(terms),))
+    return len(terms)
+
+
+def set_tech_aliases(
+    conn: psycopg.Connection, updates: Sequence[tuple[str, list[str]]]
+) -> int:
+    """Replace a term's alias list outright — the SPLIT half of THE INVARIANT.
+
+    Deliberately NOT `upsert_tech_canonical`, which unions alias lists so that aliases learned by
+    the embedding step survive a re-seed. Removing an alias needs a call that can actually remove
+    one, or `SAP` keeps claiming `SAP ECC` forever no matter what the seed says.
+    """
+    if not updates:
+        return 0
+    with conn.transaction(), conn.cursor() as cur:
+        cur.executemany(
+            "UPDATE tech_canonical SET aliases = %s WHERE term = %s",
+            [(aliases, term) for term, aliases in updates],
+        )
+    return len(updates)
+
+
+def tech_alias_collisions(conn: psycopg.Connection) -> list[dict[str, Any]]:
+    """THE INVARIANT, as a query: every term that is also a DIFFERENT term's alias.
+
+    Must return zero rows. Compared on the ladder's own match key (lowercased,
+    punctuation-stripped) rather than on the raw string, because that is what the ladder resolves
+    with — a string-equality version of this check reports 18 collisions and misses the 19th,
+    `Oracle E Business Suite` vs the alias `Oracle E-Business Suite`, which differ only by
+    punctuation the key strips. A guard that parses its input differently from the thing it
+    guards is not a guard (see `config.assert_local_database` for the same lesson).
+    """
+    return conn.execute(
+        """
+        SELECT c.term AS term, o.term AS owner
+        FROM tech_canonical c
+        JOIN tech_canonical o
+          ON o.term <> c.term
+         AND EXISTS (
+           SELECT 1 FROM unnest(COALESCE(o.aliases, '{}')) AS a
+           WHERE regexp_replace(lower(a), '[^a-z0-9]', '', 'g')
+               = regexp_replace(lower(c.term), '[^a-z0-9]', '', 'g')
+         )
+        ORDER BY c.term
+        """
+    ).fetchall()
+
+
 def find_tech_exact(conn: psycopg.Connection, key: str) -> str | None:
     """Exact match on the normalized key: lowercased, punctuation-stripped (§5.2 stage 3)."""
     row = conn.execute(
@@ -710,6 +909,58 @@ def fetch_tech_review_queue(conn: psycopg.Connection) -> list[dict[str, Any]]:
 
 def clear_tech_review_queue(conn: psycopg.Connection) -> None:
     conn.execute("TRUNCATE tech_review_queue")
+
+
+# ---------------------------------------------------------------------------
+# Intents — stored and matched, NEVER canonicalised (§5.8).
+#
+# There is no intent vocabulary here, and its absence is the design. A ladder (exact -> alias ->
+# embedding NN >0.85 -> review queue) seeded from the other team's 80 phrases used to live in this
+# section. It was a category error — rule 5 canonicalises the LONG-TAIL of NAMED PRODUCTS, and an
+# intent is a descriptive phrase with no official form — and the corpus said so plainly:
+#
+#     8,114 rows / 5,209 distinct phrases · 317 resolved (3.9%) · review queue 5,195
+#     nearest-match cosines 0.32-0.52 — correctly nowhere near the 0.85 threshold
+#
+# The other team's `lead_company_job_intent` has no canonical column either. An intent is matched
+# semantically (`search_job_intents_semantic`, on `intent_embedding`) and lexically
+# (`search_job_intents_lexical`, on the GIN index). That is what those functions are for.
+# `tech_canonical` above is the contrast, not the precedent: a product does have a canonical name.
+# ---------------------------------------------------------------------------
+
+
+def rival_coverage(conn: psycopg.Connection) -> dict[str, Any]:
+    """Their coverage, for the honest comparison: rows, jobs, companies, distinct phrases."""
+    row = conn.execute(
+        """
+        SELECT count(*) AS rows,
+               count(DISTINCT i.job_id) AS jobs,
+               count(DISTINCT j.lead_company_id) AS companies,
+               count(DISTINCT i.intent) AS distinct_intents
+        FROM lead_company_job_intent i
+        JOIN lead_company_job j ON j.id = i.job_id
+        """
+    ).fetchone()
+    return dict(row or {})
+
+
+def intent_counts(conn: psycopg.Connection) -> dict[str, Any]:
+    """What `job_intent` holds — rows, grain and reach. No vocabulary numbers: there is no
+    vocabulary (§5.8), and `distinct_intents` vs `rows` is the measurement that ended it.
+    """
+    row = conn.execute(
+        """
+        SELECT
+          (SELECT count(*) FROM job_intent WHERE source = 'leadplus-intel')    AS rows,
+          (SELECT count(DISTINCT intent) FROM job_intent
+            WHERE source = 'leadplus-intel')                                   AS distinct_intents,
+          (SELECT count(DISTINCT job_id) FROM job_intent
+            WHERE source = 'leadplus-intel')                                   AS jobs,
+          (SELECT count(DISTINCT company_id) FROM job_intent
+            WHERE source = 'leadplus-intel')                                   AS companies
+        """
+    ).fetchone()
+    return dict(row or {})
 
 
 # ---------------------------------------------------------------------------
@@ -898,19 +1149,40 @@ def verify_counts(conn: psycopg.Connection) -> dict[str, Any]:
           (SELECT count(*) FROM company_canonical)                                   AS company_canonical,
           (SELECT count(*) FROM tech_canonical)                                      AS tech_canonical,
           (SELECT count(*) FROM tech_review_queue)                                   AS tech_review_queue,
+          (SELECT count(*) FROM job_intent WHERE source = 'leadplus-intel')          AS job_intent,
+          (SELECT count(*) FROM job_intent
+             WHERE source = 'leadplus-intel' AND intent_embedding IS NULL)           AS job_intent_no_embedding,
+          (SELECT count(DISTINCT vector_dims(intent_embedding)) FROM job_intent
+             WHERE source = 'leadplus-intel' AND intent_embedding IS NOT NULL)       AS intent_dim_variants,
+          (SELECT max(vector_dims(intent_embedding)) FROM job_intent
+             WHERE source = 'leadplus-intel')                                        AS intent_dims,
+          (SELECT count(DISTINCT job_id) FROM job_intent WHERE source = 'leadplus-intel')     AS intent_jobs,
+          (SELECT count(DISTINCT company_id) FROM job_intent WHERE source = 'leadplus-intel') AS intent_companies,
           (SELECT count(*) FROM ingest_dead_letter)                                  AS dead_letters
         """
     ).fetchone()  # type: ignore[return-value]
 
 
 def orphan_job_signals(conn: psycopg.Connection) -> int:
-    """§5.4 invariant: every `job_signal.company_id` is a canonical id."""
+    """§5.4 invariant: every `job_signal.company_id` AND `job_intent.company_id` is canonical.
+
+    `job_intent` is included because it carries the same denormalised `company_id` and is fused
+    into the same company-level RRF (§8.1). A non-canonical id there would surface a company that
+    the fold was supposed to have merged away — the exact duplicate §5.4 exists to prevent, just
+    arriving through the newer table.
+    """
     row = conn.execute(
         """
-        SELECT count(*) AS n FROM job_signal s
-        WHERE NOT EXISTS (
-          SELECT 1 FROM company_canonical cc WHERE cc.canonical_id = s.company_id
-        )
+        SELECT
+          (SELECT count(*) FROM job_signal s
+            WHERE NOT EXISTS (SELECT 1 FROM company_canonical cc
+                              WHERE cc.canonical_id = s.company_id))
+          +
+          (SELECT count(*) FROM job_intent i
+            WHERE i.source = 'leadplus-intel'
+              AND NOT EXISTS (SELECT 1 FROM company_canonical cc
+                              WHERE cc.canonical_id = i.company_id))
+          AS n
         """
     ).fetchone()
     return row["n"]  # type: ignore[index]
@@ -1117,6 +1389,93 @@ def search_jobs_semantic(
     ).fetchall()
 
 
+def search_job_intents_lexical(
+    conn: psycopg.Connection, *, phrases: Sequence[str], filters: dict[str, Any], limit: int = 200
+) -> list[dict[str, Any]]:
+    """List L5 — `ts_rank` over `job_intent.intent`, the finer grain.
+
+    Why a fifth and sixth list rather than folding intents into `job_signal`'s tsv: an intent
+    phrase is 3 words and a paraphrase is 30, so a shared `ts_rank` would be dominated by the
+    longer text and the precise phrase match would be diluted exactly when it is most useful.
+    Ranking them separately and letting RRF fuse the *ranks* is the same argument that put
+    `ts_rank` and cosine in separate lists to begin with (§8.1) — RRF exists so incommensurable
+    scorers never have to be made commensurable.
+
+    Rows are deduped to the best-ranked row per JOB before they leave: a job has ~5 intents and
+    several may match, and without this a job would contribute 5 entries whose ranks then collapse
+    to one company anyway — quietly weighting a job by how many of its phrases matched, which is
+    what `coverage` and `volume` are for.
+
+    `source = 'leadplus-intel'` scopes this to OUR rows. The other team's table is not touched
+    here; a UNION with theirs would be safe (that is what provenance is for) but it would also be
+    a claim about their data's freshness that we cannot make.
+
+    Applies the SAME `_JOB_FILTERS`/`_FIRMO_FILTERS`/`_FACT_FILTERS` as every other list — an
+    intent that survived a filter the paraphrase did not would be evidence for a match that
+    never happened.
+    """
+    return conn.execute(
+        _TSQUERY_CTE
+        + f"""
+        SELECT job_id, company_id, intent, score FROM (
+          -- DISTINCT ON must lead its ORDER BY with the distinct key, which would leave the rows
+          -- ordered by job_id. The outer query restores score order: `_ranks()` reads position
+          -- as rank, so emitting these in job_id order would silently rank by primary key.
+          SELECT DISTINCT ON (i.job_id)
+                 i.job_id, i.company_id, i.intent,
+                 ts_rank(to_tsvector('english', i.intent), q.query) AS score
+          FROM job_intent i
+          JOIN job_signal j ON j.job_id = i.job_id
+          JOIN lead_company c ON c.id = i.company_id
+          CROSS JOIN q
+          WHERE q.query IS NOT NULL
+            AND i.source = 'leadplus-intel'
+            AND to_tsvector('english', i.intent) @@ q.query
+            {_JOB_FILTERS}
+            {_FIRMO_FILTERS}
+            {_FACT_FILTERS}
+          ORDER BY i.job_id, score DESC, i.id
+        ) t
+        ORDER BY score DESC, job_id
+        LIMIT %(limit)s
+        """,
+        {"phrases": list(phrases), "limit": limit, **filters},
+    ).fetchall()
+
+
+def search_job_intents_semantic(
+    conn: psycopg.Connection, *, qvec: Sequence[float], filters: dict[str, Any], limit: int = 200
+) -> list[dict[str, Any]]:
+    """List L6 — exact cosine over `job_intent.intent_embedding`. No ANN index (rule 7).
+
+    3072 dims, the same space as `job_signal.embedding` and `company_signal.embedding`, so the
+    single query vector built in `retrieve.prepare` compares against all three.
+    """
+    return conn.execute(
+        f"""
+        SELECT job_id, company_id, intent, score FROM (
+          -- See the lexical twin: DISTINCT ON dictates the inner order, the outer query restores
+          -- score order so that row position means rank.
+          SELECT DISTINCT ON (i.job_id)
+                 i.job_id, i.company_id, i.intent,
+                 1 - (i.intent_embedding <=> %(qvec)s::vector) AS score
+          FROM job_intent i
+          JOIN job_signal j ON j.job_id = i.job_id
+          JOIN lead_company c ON c.id = i.company_id
+          WHERE i.intent_embedding IS NOT NULL
+            AND i.source = 'leadplus-intel'
+            {_JOB_FILTERS}
+            {_FIRMO_FILTERS}
+            {_FACT_FILTERS}
+          ORDER BY i.job_id, i.intent_embedding <=> %(qvec)s::vector, i.id
+        ) t
+        ORDER BY score DESC, job_id
+        LIMIT %(limit)s
+        """,
+        {"qvec": _vec(qvec), "limit": limit, **filters},
+    ).fetchall()
+
+
 def search_companies_lexical(
     conn: psycopg.Connection, *, phrases: Sequence[str], filters: dict[str, Any], limit: int = 200
 ) -> list[dict[str, Any]]:
@@ -1256,7 +1615,15 @@ def fetch_jobs_for_companies(
     return conn.execute(
         f"""
         SELECT j.job_id, j.company_id, jj.title, j.title_norm, j.paraphrase, j.technologies,
-               j.posted_date, j.function, j.seniority, j.initiative, j.is_repost, j.confidence
+               j.posted_date, j.function, j.seniority, j.initiative, j.is_repost, j.confidence,
+               -- The finer grain, carried onto the evidence line so a card can show WHY beyond
+               -- the paraphrase. Aggregated in a subquery rather than a join: joining ~5 intent
+               -- rows per job would multiply the job rows and silently inflate `volume`.
+               COALESCE((
+                 SELECT array_agg(i.intent ORDER BY i.intent)
+                 FROM job_intent i
+                 WHERE i.job_id = j.job_id AND i.source = 'leadplus-intel'
+               ), '{{}}') AS intents
         FROM job_signal j
         JOIN lead_company c ON c.id = j.company_id
         LEFT JOIN lead_company_job jj ON jj.id = j.job_id

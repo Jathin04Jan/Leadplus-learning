@@ -190,14 +190,29 @@ def bucket() -> TokenBucket:
     return _bucket
 
 
-def estimate_tokens(*texts: str) -> int:
-    """Rough token estimate for budgeting: ~4 chars/token, plus room for the reply.
+# Chars per token, CALIBRATED against a real run rather than guessed.
+#
+# Measured on the 25-row gate (job_normalizer/v6, gpt-4.1-mini): 25 calls reported 174,938 input
+# tokens for ~32,000 chars of prompt+message each => 4.57 chars/token. The previous value here
+# was 3.5, which over-estimated every call by ~30% — and since the bucket throttles on the
+# estimate, that was 30% of the run's wall-clock spent waiting for budget that was never going to
+# be spent. On 2,886 jobs it was the difference between ~4.8h and ~2.5h.
+#
+# 4.4 keeps ~4% of head-room under the measured 4.57 (English prose tokenizes fairly uniformly,
+# but the corpus is multilingual and German tokenizes worse). The real safety margin is
+# TPM_MARGIN=0.80, which is untouched: this makes the estimator *accurate*, it does not make the
+# budget bigger. Under-estimating costs a 429; over-estimating costs hours.
+CHARS_PER_TOKEN = 4.4
 
-    Deliberately crude — the bucket only needs to be approximately right, and over-estimating
-    costs a little throughput while under-estimating costs a 429.
+
+def estimate_tokens(*texts: str) -> int:
+    """Token estimate for budgeting, plus room for the reply.
+
+    The bucket needs this to be approximately right in BOTH directions. Padding it is not a free
+    safety measure — it directly throttles throughput against a budget the calls never use.
     """
     chars = sum(len(t) for t in texts)
-    return int(chars / 3.5) + 800
+    return int(chars / CHARS_PER_TOKEN) + 800
 
 
 RETRYABLE = (RateLimitError, APITimeoutError, APIConnectionError, InternalServerError)

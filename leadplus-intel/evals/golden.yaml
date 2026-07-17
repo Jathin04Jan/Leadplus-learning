@@ -1,5 +1,32 @@
 # LeadPlus Intent Search — golden set (ARCHITECTURE.md §14)
 #
+# ############################################################################
+# ##  INVALID — DO NOT RUN. THIS FILE IS DEAD AND `scripts/eval.py` REFUSES  ##
+# ############################################################################
+#
+# Every `relevant` / `forbidden` list below is a list of `lead_company.id` values from the
+# SYNTHETIC corpus (301 companies, ids 1-301). That corpus is gone: the database now holds a
+# 1:1 clone of the real `leadplus_dev` (23,063 companies), and those same ids now identify
+# COMPLETELY DIFFERENT REAL COMPANIES.
+#
+#     id 1   was  a planted "SAP + Snowflake + AWS manufacturer"
+#     id 1   IS   "SILVIA PEREZ" — Human Resources Services
+#     id 2   IS   "Fanuc Robotics America Corporation"
+#     id 301 IS   "Greenspace Industrial" — Warehousing and Storage
+#
+# So every label here is now a random pointer. Running this file would not produce a bad
+# measurement; it would produce a CONFIDENT MEANINGLESS ONE — precision@10 computed against
+# arbitrary companies, reported to 3 decimal places. That is the exact disease this project
+# exists to cure (a green suite over a broken search), so `eval.py` hard-fails instead of
+# scoring it. See `_assert_labels_still_valid` there.
+#
+# TO REVIVE IT: the labels are reproducible — each query records the `rule` used to generate it.
+# Re-run each `rule` against the real corpus and rewrite `relevant`. But read §14's warning
+# first: labels regenerated from the same predicate the scorer reads measure REGRESSIONS ONLY,
+# and on a real corpus that is a weaker claim than it was on a planted one. Real labelled
+# queries from someone who sells to these companies remain the only thing that measures
+# relevance.
+#
 # ============================================================================
 # READ THIS BEFORE TRUSTING A NUMBER PRODUCED FROM THIS FILE
 #

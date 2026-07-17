@@ -1,6 +1,8 @@
 """Stage 4 — embeddings (ARCHITECTURE.md §5.2 stage 4).
 
-`text-embedding-3-small`, 1536 dims, batched 100 texts per call.
+`text-embedding-3-large`, 3072 dims, batched 100 texts per call. The dims are set by config.EMBED_DIMS;
+they are 3072 so that one query vector compares against job_signal, company_signal AND job_intent —
+including, if ever UNIONed, the other team's 3072-dim `lead_company_job_intent`.
 
 **Embed the paraphrase, never the raw description.** The paraphrase is the normalized signal;
 the description is 60-70% boilerplate that would dominate the vector and make every posting look
@@ -45,7 +47,7 @@ async def embed_texts(texts: Sequence[str]) -> list[list[float]]:
         if len(vector) != config.EMBED_DIMS:
             raise RuntimeError(
                 f"expected {config.EMBED_DIMS}-dim embeddings, got {len(vector)}; "
-                "the schema's vector(1536) columns would reject this"
+                f"the schema's vector({config.EMBED_DIMS}) columns would reject this"
             )
     return out
 
