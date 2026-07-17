@@ -47,7 +47,7 @@ verified 1:1 clone of `leadplus_dev` (72 tables, 244,659 rows). Re-measured:
 |---|---|
 | 22,126 jobs / 23,062 companies | 22,251 jobs (**13,082 active**) / 23,063 companies (**22,966 active**) |
 | job ads carry text | **only 2,886 active jobs have a description >200 chars** — ~78% are stubs |
-| `posted_date` populated | **125 of those 2,886.** The recency axis is mostly dead. Scraper gap. |
+| `posted_date` populated | **0 in the live index.** The 125 dated postings were all `.example` fixtures, now excluded — so the recency axis is dead. Scraper gap. |
 | copy-on-write duplication (2–3×) | **barely populated** — 28 tenant rows total. See §5.4's note. |
 | `lead_query` COMPANY_INDUSTRY = 16,870 | **91 rows** |
 | ingest $20–40 / ~2h | **$3.79 / ~2.5h** for 2,886 jobs + 487 companies |
@@ -71,60 +71,57 @@ Consequences already realised:
   companies chosen at random. `scripts/eval.py` hard-fails rather than score it.
 * The corpus is **multilingual** (German is common).
 
-### ⚠️ The clone contains seeded demo data, and it is load-bearing in the worst way
+What shipped since this spec was written (so §5 below reads as *design*, not current counts):
+* **The full company index is 22,876**, not the 462/487 text-bearing subset §5.3–§5.4 describe.
+  The other ~22.4k were added by a deterministic template (`scripts/backfill_company_signal.py`),
+  one embedding each (~$0.13 total), so structural queries ("manufacturers in California") return
+  results instead of 0. `job_signal` (2,761) and `job_intent` (7,381) are unchanged.
+* **The contact role census shipped** (`contact_signal`, §3 and SEARCH-EXPLAINED §9): 53,746 roles
+  across 13,539 companies, storing NO personal data — a 4th retrieval source consulted only in
+  `PEOPLE` result mode.
+* **The zero-explainer shipped** (SEARCH-EXPLAINED §10): an honest zero now names the limiting
+  filter and its coverage %, instead of a blank page.
+
+### The clone contained seeded demo data — now excluded from the index
 
 `leadplus_dev` carries **25 fabricated companies** — `tenant_id = 29`, names prefixed
-`Synthetic `, domains ending `.example` (RFC 2606, reserved and unresolvable). They own **125 of
-the 2,886 extractable postings (4.3%)**, and their descriptions are one ERP template:
+`Synthetic `, domains ending `.example` (RFC 2606, reserved and unresolvable). Their descriptions
+are one ERP template:
 
 > *"Synthetic Northstar Components is hiring an ERP Transformation Program Manager to coordinate
 > a multi-year review of the systems supporting its manufacturing operations… document the
 > current SAP ECC landscape…"*
 
-**Two things follow, and both matter more than the 4.3% suggests.**
-
-**1. `posted_date` is 100% synthetic within the indexed corpus. The recency axis is not "mostly
-dead" — it is dead, and what remains alive is fiction.**
+**Current state — they are excluded from this index.** They are dropped at the company fold by a
+one-line `FIXTURE_PREDICATE` (`domain LIKE '%.example'`) in `repository.py`, so nothing downstream
+can index them. Verified against the live DB:
 
 ```
-extractable postings (desc > 200 chars) with a posted_date : 125
-   ... belonging to synthetic companies                    : 125
-   ... belonging to real companies                         :   0     <-- ZERO
+.example companies in company_signal                        :     0
+indexed job_signal rows carrying a posted_date              :     0   (of 2,761)
 ```
 
-Real dated postings do exist (22 active, 62 total) — but **not one of them carries a description
-over 200 chars**, so not one is extractable. So every non-NULL `job_signal.posted_date` in this
-index belongs to a company that does not exist.
+**Why they were excluded — and the real finding underneath.** When first ingested with the
+fixtures included, the 25 synthetic companies took **9–10 of every top 10**: they were built to,
+each carrying `SAP + Snowflake + AWS` exactly, a combination no real company in the pool has.
+Surfacing that (rather than quietly dropping rows and reporting a clean number) was the honest
+move; excluding them at the fold was the fix.
 
-> **UPDATE — this was fixed after this section was written.** The `.example` fixtures are now
-> excluded from the index at the company fold (`FIXTURE_PREDICATE` in `repository.py`). Verified
-> against the live DB: **0** `.example` companies in `company_signal`, and **0 of 2,761** indexed
-> `job_signal` rows carry a `posted_date`. So a `since_days` query no longer returns fictions — it
-> returns **nothing**, and the zero-explainer (§10) says why ("no indexed posting carries a date").
-> The finding below stands (the recency axis is dead); only the *symptom* changed from "returns
-> fictions" to "honestly returns zero".
+The deeper finding they were masking is a **data gap in the real corpus, not a bug**: those 25 were
+the *only* rows that carried a `posted_date`. With them gone, **0 of the 2,761 indexed postings
+carry a date at all.** So:
 
-The consequence, before the fix, was a silent, confident lie: any query with `since_days` could
-only return synthetic companies, because they were the only rows that could pass a date filter.
-"Manufacturers hiring for SAP in the last quarter" returned a ranked list of fictions, with
-evidence and paraphrases, at high confidence. That is precisely the failure mode this project
-exists to end — and it is now closed at the fold.
+* A time filter (`since_days`, "last quarter") now returns **nothing** — not fictions — and the
+  zero-explainer (§10) says why ("no indexed posting carries a date") instead of failing silently.
+* The **recency axis is effectively dead**: `HIRING` mode weights `recency` at 0.40, its largest
+  single weight, and on real data that term is 0.0 for every company. This is the honest limit, not
+  a thing to wave at — the scraper has never once captured a date on a posting it also captured text
+  for. The recency half of the thesis (*"a company posting this six days ago is actively
+  investing"*) is therefore **unprovable on this clone** until the scraper fills dates.
 
-It also means the **thesis is currently unprovable on this data**. §0's wedge is *"a company
-posting this six days ago is actively investing"* — recency of hiring signal. Zero real postings
-carry a date. `HIRING` mode weights `recency` at **0.40**, its largest single weight; on real data
-that term is 0.0 for every company. This is **not a scraper gap to be waved at** — it is the
-finding: the scraper has never once captured a date on a posting it also captured text for.
-
-**2. The other team's `lead_company_job_intent` describes ONLY these 25 fictions.**
-All 451 rows, all 92 jobs, all 25 companies — every one `.example`. See §5.8.
-
-**These WERE surfaced first, then excluded.** The 2,886 were initially ingested with the synthetic
-rows included — the honest move being to surface the problem rather than quietly drop rows and
-report a clean number. Once surfaced (they took 9–10 of every top 10, ranking fictions above real
-leads), they were excluded via the one-line `FIXTURE_PREDICATE` (`domain LIKE '%.example'`) at the
-company fold, so nothing downstream can index them. Whether demo data belongs in `leadplus_dev` at
-all remains a decision for whoever put it there — but it no longer contaminates this derived index.
+One related note for anyone reading the rival table: the other team's read-only
+`lead_company_job_intent` (451 rows / 92 jobs / 25 companies) describes **only** these same 25
+fictions (§5.8). Our own `job_intent` (7,381 rows) is built from the real corpus and is unaffected.
 
 This build proves the architecture and the three defects are fixed. Whether job-intent is a
 *product* is now answerable on real data for the first time — but not from this document.
