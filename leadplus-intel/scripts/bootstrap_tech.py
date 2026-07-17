@@ -80,7 +80,14 @@ SEED_TECH: dict[str, list[str]] = {
     #
     # `ECC` (the bare acronym) belongs to SAP ECC, not to SAP.
     "SAP": [],
-    "SAP ECC": ["ECC"],
+    # `ECC` (the bare acronym), plus Apollo's two verbose spellings of the SAME product. Measured:
+    # 12 companies carry `SAP ECC`, 9 carry `SAP ERP Central Component (ECC)`, 1 carries the `6.0`
+    # variant — and "ERP Central Component" is literally what ECC abbreviates, so they are one
+    # product under three spellings, the exact rule-5 case. Without these aliases a query for
+    # `SAP ECC` returned 10-12 of the ~17 real ECC shops and the rest were invisible — defect #2
+    # (`Amazon AWS` hiding 40 of 65 AWS users) in a new costume. They are a SPLIT away from `SAP`
+    # and `SAP S/4HANA` (different products) but a MERGE among themselves.
+    "SAP ECC": ["ECC", "SAP ERP Central Component (ECC)", "SAP ERP Central Component (ECC) 6.0"],
     "SAP ERP": [],
     "SAP R/3": [],
     "SAP S/4HANA": ["SAP S4", "S/4HANA", "S4 HANA", "S/4 HANA", "S4/HANA", "SAP S/4", "S4HANA",

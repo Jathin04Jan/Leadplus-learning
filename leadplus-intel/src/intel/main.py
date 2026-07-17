@@ -216,6 +216,15 @@ async def run_search(
         excluded = excluded[:limit]
     timer.mark("score_ms")
 
+    # SEARCH-EXPLAINED §10 — an honest zero explains itself. Only when a SEARCH retrieved nothing
+    # (not a refusal — that returned above), and only when a hard filter is to blame; `explain_zero`
+    # returns None otherwise and the UI shows its generic empty message. It re-runs the filter set
+    # minus one filter at a time, which is cheap over 22,876 rows.
+    zero_explainer = None
+    if not companies:
+        zero_explainer = retrieve.explain_zero(conn, chips, matcher)
+    timer.mark("explain_ms")
+
     return SearchResponse(
         chips=chips,
         companies=companies,
@@ -224,6 +233,8 @@ async def run_search(
         query_paraphrase=vectors.paraphrase,
         notes=notes + retrieval.notes,
         excluded=excluded,
+        zero_explainer=zero_explainer,
+        result_mode=chips.result_mode,
     )
 
 

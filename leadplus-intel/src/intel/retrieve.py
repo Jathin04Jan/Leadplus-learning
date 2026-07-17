@@ -31,7 +31,7 @@ import psycopg
 
 from . import embed, repository
 from .canonicalize import industry_key, location_key, tech_key
-from .models import Chips, IntentMode, TermGroup, TermSource, Value
+from .models import Chips, IntentMode, ResultMode, TermGroup, TermSource, Value, ZeroReason
 
 if TYPE_CHECKING:  # pragma: no cover — import only for the type, never at runtime.
     # score.py imports Retrieval from this module, so importing score here for real would be a
@@ -592,6 +592,12 @@ class Retrieval:
     list_sizes: dict[str, int] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
+    # §9 — the role census per company (PEOPLE mode only). `company_contacts` holds the ROLE rows
+    # (never names); `contact_counts` is the total matching roles per company for the card's
+    # "N finance roles" line. Both empty in COMPANIES mode.
+    company_contacts: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
+    contact_counts: dict[int, int] = field(default_factory=dict)
+
     # CHANGES-v2 §10 — the *un-negated* retrieval: what would have been returned had the query
     # not excluded anything. None when nothing was negated. Scoring this whole set is what lets an
     # exclusion be reported as "would have ranked #1" rather than "was removed, trust me".
@@ -611,20 +617,29 @@ def _fuse(
     phrases: Sequence[str],
     qvec: Sequence[float],
     filters: dict[str, Any],
+    include_contacts: bool = False,
+    contact_phrases: Sequence[str] = (),
 ) -> tuple[dict[int, float], dict[int, float], dict[int, int], dict[str, int]]:
     """§6[3]-[4] — the retrieval lists and their fusion, for one set of filters.
 
-    SIX lists now, not four. The two added ones retrieve over `job_intent` — the finer grain
-    adopted from the other team — and they are fused by the SAME company-level RRF as the rest
-    (§8.1), which is the whole reason adding a source is cheap here: RRF takes ranks, so a new
-    scorer needs no re-weighting, no normalisation and no tuning to join. It contributes
-    1/(60+rank) like everything else.
+    SIX lists always, EIGHT in PEOPLE mode. Two retrieve over `job_intent` — the finer grain
+    adopted from the other team — and are fused by the SAME company-level RRF as the rest (§8.1),
+    which is the whole reason adding a source is cheap here: RRF takes ranks, so a new scorer needs
+    no re-weighting, no normalisation and no tuning to join. It contributes 1/(60+rank) like
+    everything else.
 
     They are a genuinely different signal, not a duplicate of `job_signal`: a paraphrase and its
     intents are two readings of one posting, and a query phrased as an initiative ("erp
     transformation program") hits the intent index precisely while hitting the paraphrase only
     diffusely. A company found by both rises — which is exactly what §5.1 says two document types
     are for, applied at a finer grain.
+
+    `include_contacts` (SEARCH-EXPLAINED §9) adds the two `contact_signal` lists — the 4th document
+    type, the "who is there" signal. It is GATED on `result_mode == PEOPLE` rather than always-on,
+    and that gate is deliberate: a COMPANIES query ("companies hiring for ERP migration") must
+    retrieve and rank byte-identically to before this feature existed, so the contact lists simply
+    do not run for it. In PEOPLE mode they fuse alongside jobs and companies through the same RRF —
+    the company is still the answer, the contact is the evidence.
     """
     # The job-side lists share one filtered survivor set; the company lists share the other
     # (no date filter — companies have no posted_date, §6[3b]).
@@ -661,7 +676,27 @@ def _fuse(
     l5 = to_company_ranks(_ranks(int_lex, "job_id"), job_to_company)
     l6 = to_company_ranks(_ranks(int_sem, "job_id"), job_to_company)
 
-    fused = rrf(l1, l2, l3, l4, l5, l6)
+    # §9 — the contact lists (L7, L8) already return company-level rows (best contact per company),
+    # so they need no job->company projection. They only run in PEOPLE mode.
+    con_lex: list[dict[str, Any]] = []
+    con_sem: list[dict[str, Any]] = []
+    company_lists = [l1, l2, l3, l4, l5, l6]
+    if include_contacts:
+        # The contact lexical list matches ROLE words only ("CFO"), never the industry phrase —
+        # "Retail" is a company fact, already applied by `_FACT_FILTERS`, and matching it against a
+        # census would count a "Retail Operations Manager" as a finance hit.
+        con_lex = (
+            repository.search_contacts_lexical(
+                conn, phrases=contact_phrases, filters=filters, limit=LIST_DEPTH
+            )
+            if contact_phrases
+            else []
+        )
+        con_sem = repository.search_contacts_semantic(conn, qvec=qvec, filters=filters, limit=LIST_DEPTH)
+        company_lists.append(_ranks(con_lex, "company_id"))
+        company_lists.append(_ranks(con_sem, "company_id"))
+
+    fused = rrf(*company_lists)
     sizes = {
         "job_lexical": len(job_lex),
         "job_semantic": len(job_sem),
@@ -669,6 +704,8 @@ def _fuse(
         "intent_semantic": len(int_sem),
         "company_lexical": len(com_lex),
         "company_semantic": len(com_sem),
+        "contact_lexical": len(con_lex),
+        "contact_semantic": len(con_sem),
         "candidates": len(fused),
     }
     return fused, normalize_01(fused), job_to_company, sizes
@@ -684,8 +721,10 @@ def _hydrate(
     filters: dict[str, Any],
     vectors: QueryVectors,
     list_sizes: dict[str, int],
+    contact_phrases: Sequence[str] = (),
+    include_contacts: bool = False,
 ) -> Retrieval:
-    """Attach the scoring inputs — details, jobs, evidence — for a candidate set."""
+    """Attach the scoring inputs — details, jobs, evidence (and, in PEOPLE mode, contacts)."""
     wanted = set(company_ids)  # hoisted: rebuilding this per job is O(jobs x candidates)
     retrieved_job_ids: dict[int, set[int]] = defaultdict(set)
     for job_id, cid in job_to_company.items():
@@ -702,6 +741,17 @@ def _hydrate(
     for row in repository.fetch_jobs_for_companies(conn, company_ids=company_ids, filters=filters):
         company_jobs[row["company_id"]].append(row)
 
+    company_contacts: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    contact_counts: dict[int, int] = {}
+    if include_contacts and company_ids:
+        for row in repository.fetch_contacts_for_companies(
+            conn, company_ids=company_ids, phrases=contact_phrases
+        ):
+            company_contacts[row["company_id"]].append(row)
+        contact_counts = repository.count_company_contacts(
+            conn, company_ids=list(company_ids), phrases=contact_phrases
+        )
+
     return Retrieval(
         fused={cid: fused[cid] for cid in company_ids if cid in fused},
         best_doc={cid: best_doc[cid] for cid in company_ids if cid in best_doc},
@@ -709,6 +759,8 @@ def _hydrate(
         retrieved_job_ids=dict(retrieved_job_ids),
         details=details,
         list_sizes=list_sizes,
+        company_contacts=dict(company_contacts),
+        contact_counts=contact_counts,
     )
 
 
@@ -744,6 +796,168 @@ def attribute_exclusions(
     return out
 
 
+# ---------------------------------------------------------------------------
+# SEARCH-EXPLAINED §10 — the zero-explainer.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Dim:
+    """One hard filter, as the zero-explainer sees it: how to neutralise it, name it, and how its
+    coverage reads. The order of `_DIMS` is only a stable tiebreak when two dims are equally scarce.
+    """
+
+    key: str
+    neutralize: dict[str, Any]  # params that turn this filter into a no-op
+    coverage_field: str  # which `field_coverage` count reads on it (a "% have any" number)
+    coverage_kind: str  # 'field' -> "% carry any X"; 'scarce' -> "N of universe are X"
+
+
+_DIMS: tuple[_Dim, ...] = (
+    _Dim("naics", {"naics": []}, "has_naics", "field"),
+    _Dim("sic", {"sic": []}, "has_sic", "field"),
+    _Dim("industry", {"industry_pos": [], "industry_neg": []}, "has_industry", "scarce"),
+    _Dim("location", {"loc_pos": [], "loc_neg": []}, "has_location", "scarce"),
+    _Dim("segment", {"segments": []}, "has_segments", "field"),
+    _Dim("linkedin", {"has_linkedin": None}, "has_linkedin", "field"),
+    _Dim("employees", {"min_employees": None, "max_employees": None}, "universe", "scarce"),
+    _Dim("revenue", {"min_revenue_usd": None, "max_revenue_usd": None}, "has_revenue", "field"),
+    _Dim("negation", {"neg_uses": [], "neg_hiring": []}, "universe", "scarce"),
+)
+
+
+def _dim_active(dim: _Dim, filters: dict[str, Any]) -> bool:
+    """Is this dimension actually asked for? (i.e. would neutralising it change the query.)"""
+    for param, noop in dim.neutralize.items():
+        if filters.get(param) != noop:
+            return True
+    return False
+
+
+def _neutralized(filters: dict[str, Any], dims: Sequence[_Dim]) -> dict[str, Any]:
+    out = dict(filters)
+    for dim in dims:
+        out.update(dim.neutralize)
+    return out
+
+
+def _dim_label(key: str, chips: Chips) -> str:
+    """The human name of a filter, from the chips the user actually sees."""
+    if key == "naics":
+        return "NAICS " + ", ".join(chips.naics)
+    if key == "sic":
+        return "SIC " + ", ".join(chips.sic)
+    if key == "industry":
+        vals = [v.value for v in chips.industries]
+        return "industry " + " / ".join(vals)
+    if key == "location":
+        vals = [v.value for v in chips.locations]
+        return "location " + " / ".join(vals)
+    if key == "segment":
+        return "segment " + ", ".join(chips.segments)
+    if key == "linkedin":
+        return "no LinkedIn profile" if chips.has_linkedin is False else "has a LinkedIn profile"
+    if key == "employees":
+        lo, hi = chips.min_employees, chips.max_employees
+        return f"employees {lo or ''}-{hi or ''}".strip("-")
+    if key == "revenue":
+        lo, hi = chips.min_revenue_usd, chips.max_revenue_usd
+        parts = []
+        if lo is not None:
+            parts.append(f"≥ ${lo:,.0f}")
+        if hi is not None:
+            parts.append(f"≤ ${hi:,.0f}")
+        return "revenue " + " and ".join(parts)
+    if key == "negation":
+        return "an exclusion"
+    return key
+
+
+def explain_zero(
+    conn: psycopg.Connection, chips: Chips, matcher: "TermMatcher"
+) -> ZeroReason | None:
+    """§10 — WHY a SEARCH returned zero, with the measured coverage number and a relax suggestion.
+
+    `candidates == 0` means no company passed the hard filters (see `repository.count_companies_passing`),
+    so the whole explanation is a limiter analysis over those filters: neutralise them one at a time
+    and count. The limiter is the single most restrictive filter (smallest "only this" count); the
+    relax suggestion drops it and recounts. Returns None when there is no hard filter to blame — the
+    caller then falls back to the generic empty message.
+    """
+    predicate = build_filters(conn, chips, matcher)
+    filters = predicate.filters
+    active = [dim for dim in _DIMS if _dim_active(dim, filters)]
+    if not active:
+        return None
+
+    # Only explain a zero that the hard filters actually caused. If companies pass every filter yet
+    # none were returned, the zero came from somewhere else (e.g. all candidates lost their detail
+    # row) and a limiter analysis would mislead — fall back to the generic empty message.
+    if repository.count_companies_passing(conn, filters) > 0:
+        return None
+
+    cov = repository.field_coverage(conn)
+    universe = int(cov["universe"])
+
+    # "only this filter" count for each active dim (all OTHER dims neutralised).
+    only_counts: dict[str, int] = {}
+    for dim in active:
+        others = [d for d in _DIMS if d.key != dim.key]
+        only_counts[dim.key] = repository.count_companies_passing(conn, _neutralized(filters, others))
+
+    # The limiter is the scarcest single filter. Ties break on `_DIMS` order (stable).
+    limiter = min(active, key=lambda d: (only_counts[d.key], _DIMS.index(d)))
+
+    # Relax: drop the limiter, keep everything else, recount.
+    relax_filters = _neutralized(filters, [limiter])
+    relax_count = repository.count_companies_passing(conn, relax_filters)
+    remaining = [d for d in active if d.key != limiter.key]
+    relax_desc = (
+        "companies matching " + " and ".join(_dim_label(d.key, chips) for d in remaining)
+        if remaining
+        else "companies overall"
+    )
+
+    # Coverage note — the number that proves "data gap, not search bug".
+    only_n = only_counts[limiter.key]
+    if limiter.coverage_kind == "field":
+        have = int(cov.get(limiter.coverage_field, 0) or 0)
+        pct = (have / universe * 100) if universe else 0.0
+        field_word = {
+            "naics": "any NAICS code",
+            "sic": "any SIC code",
+            "segment": "any segment",
+            "linkedin": "a LinkedIn profile",
+            "revenue": "a revenue figure",
+        }.get(limiter.key, "this field")
+        coverage_note = f"{only_n} of {universe:,} companies match {_dim_label(limiter.key, chips)}"
+        # Only add the "% carry any X" clause when it is INFORMATIVE — i.e. the field itself is
+        # sparse (the NAICS story). When ~every company has the field but not this value (the
+        # segment story: 100% have a segment, none have "Mid-Market"), that clause reads as a
+        # non-sequitur, so the bare "0 of N carry this value" is the honest sentence.
+        if pct < 90.0:
+            coverage_note += f"; only {pct:.1f}% of companies carry {field_word}"
+        else:
+            coverage_note += " — that value is simply not present in the data"
+    else:
+        pct = (only_n / universe * 100) if universe else 0.0
+        coverage_note = (
+            f"only {only_n} of {universe:,} companies match {_dim_label(limiter.key, chips)} "
+            f"({pct:.1f}% of the index)"
+        )
+
+    return ZeroReason(
+        universe=universe,
+        applied=[_dim_label(d.key, chips) for d in active],
+        limiter_label=_dim_label(limiter.key, chips),
+        limiter_only_count=only_n,
+        coverage_note=coverage_note,
+        relax_label=f"Drop {_dim_label(limiter.key, chips)}",
+        relax_count=relax_count,
+        relax_desc=relax_desc,
+    )
+
+
 def retrieve(
     conn: psycopg.Connection, chips: Chips, vectors: QueryVectors, matcher: "TermMatcher"
 ) -> Retrieval:
@@ -766,9 +980,19 @@ def retrieve(
     """
     predicate = build_filters(conn, chips, matcher)
     phrases = chip_phrases(chips)
+    include_contacts = chips.result_mode == ResultMode.PEOPLE
+    # Role words only (no industries): the census answers "which role", not "which industry".
+    contact_phrases = list(
+        dict.fromkeys(v.strip() for g in chips.positive_groups() for v in g.any_of if v.strip())
+    )
 
     fused, best_doc, job_to_company, sizes = _fuse(
-        conn, phrases=phrases, qvec=vectors.qvec, filters=predicate.filters
+        conn,
+        phrases=phrases,
+        qvec=vectors.qvec,
+        filters=predicate.filters,
+        include_contacts=include_contacts,
+        contact_phrases=contact_phrases,
     )
     retrieval = _hydrate(
         conn,
@@ -779,6 +1003,8 @@ def retrieve(
         filters=predicate.filters,
         vectors=vectors,
         list_sizes=sizes,
+        contact_phrases=contact_phrases,
+        include_contacts=include_contacts,
     )
     retrieval.notes = list(predicate.notes)
 

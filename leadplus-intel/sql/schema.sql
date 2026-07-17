@@ -136,6 +136,56 @@ CREATE INDEX IF NOT EXISTS job_intent_tsv_idx
 -- filled with 5,195 phrases that were never broken. An intent needs no vocabulary: it needs its
 -- embedding, which it has.
 
+-- ---------------------------------------------------------------------------
+-- contact_signal — SEARCH-EXPLAINED §9. A ROLE CENSUS, not a contact database.
+--
+-- The product question this answers is "which COMPANIES have a CFO / a Big-4 alumnus / a VP of
+-- Finance", and a company is still the answer — the contact is only the evidence line ("has a VP
+-- of Finance Transformation"). You do NOT need identifying fields to answer at company level, so
+-- none are stored: there is NO first_name, last_name, full_name, email, phonee164, linkedin_url
+-- or notes column here, by design and by the ingest that never selects them. `\d contact_signal`
+-- is the proof.
+--
+-- HONEST CAVEAT (kept in the open, per §9): "the CFO of Acme" still identifies one person. This is
+-- data-MINIMISED and pseudonymous, not anonymous. Storing a role and a company is a smaller claim
+-- than storing a person, and that is the whole point — it is the smallest thing that answers the
+-- question.
+--
+-- `function` is `ContactFunction` and `seniority` is `ContactSeniority` — a SEPARATE vocabulary
+-- from the job `Function`/`Seniority` enums, on purpose (§9). A job enum describes a requisition;
+-- a contact enum describes a person. Merging them (adding FINANCE to the job `Function`) is how a
+-- schema starts lying about what it holds.
+--
+-- Derived, disposable, rebuildable like every table here: `scripts/ingest_contacts.py` recreates
+-- it from `lead_contact` (+ `apollo_contact_data` JSON for the Big-4 flag), no LLM — the
+-- classification is deterministic and the only spend is the embedding.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS contact_signal (
+  id               bigserial PRIMARY KEY,
+  company_id       bigint NOT NULL,      -- ALWAYS company_canonical.canonical_id, as job_signal
+  lead_contact_id  bigint NOT NULL,
+  canonical_title  text,                 -- the ROLE (a title), never a name
+  seniority        text,                 -- ContactSeniority: C_LEVEL|VP|DIRECTOR|MANAGER|IC|OTHER
+  function         text,                 -- ContactFunction: FINANCE|IT|OPERATIONS|PROCUREMENT|...
+  department       text,
+  is_big4_alum     boolean DEFAULT false,-- a PAST (non-current) employer is Deloitte/PwC/EY/KPMG
+  prior_employer   text,                 -- the Big-4 firm they left, when is_big4_alum
+  landed_at        date,                 -- start date of the CURRENT role, for "recently landed"
+  census_text      text NOT NULL,        -- the embedded role sentence — no PII, role words only
+  tsv              tsvector GENERATED ALWAYS AS (to_tsvector('english', census_text)) STORED,
+  embedding        vector(3072),         -- NO index. Rule 7.
+  prompt_version   text NOT NULL,
+  model            text NOT NULL,
+  run_at           timestamptz DEFAULT now()
+);
+-- The §5.7 idempotency key: one census row per contact. Re-running is an upsert; bumping
+-- prompt_version re-processes only the delta (the fetch's NOT EXISTS keys on version+model).
+CREATE UNIQUE INDEX IF NOT EXISTS contact_signal_contact_idx ON contact_signal (lead_contact_id);
+CREATE INDEX IF NOT EXISTS contact_signal_company_id_idx ON contact_signal (company_id);
+CREATE INDEX IF NOT EXISTS contact_signal_tsv_idx ON contact_signal USING gin(tsv);
+CREATE INDEX IF NOT EXISTS contact_signal_function_idx ON contact_signal (function);
+CREATE INDEX IF NOT EXISTS contact_signal_big4_idx ON contact_signal (is_big4_alum) WHERE is_big4_alum;
+
 -- §5.2 stage 3 — the controlled technology vocabulary (rule 5).
 --
 -- This one STAYS, and the contrast with intents above is the whole of rule 5: a product has a

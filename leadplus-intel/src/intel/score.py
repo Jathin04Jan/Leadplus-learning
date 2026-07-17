@@ -27,8 +27,10 @@ from .models import (
     Breakdown,
     Chips,
     CompanyResult,
+    ContactEvidence,
     Evidence,
     IntentMode,
+    ResultMode,
     TermGroup,
     TermSource,
 )
@@ -437,12 +439,21 @@ def rank(
     weights = tuning.weights[chips.intent_mode]
     excluded_by = excluded_by or {}
 
+    # SEARCH-EXPLAINED §9 — in PEOPLE mode the answer is "companies that HAVE the asked role", so a
+    # company with zero matching roles is not evidence of anything and is dropped. This is what
+    # makes the contact index decisive rather than just one more diffuse RRF source: the company is
+    # still the answer and RRF still orders it, but the role has to actually be there.
+    people_gate = chips.result_mode == ResultMode.PEOPLE and bool(retrieval.contact_counts)
+
     results: list[CompanyResult] = []
     for cid in retrieval.candidates:
         detail = retrieval.details.get(cid)
         if detail is None:
             # A company_signal row vanished between the list query and the detail query. It has
             # no paraphrase and therefore nothing to show or explain; skipping is honest.
+            continue
+
+        if people_gate and retrieval.contact_counts.get(cid, 0) == 0:
             continue
 
         jobs = retrieval.company_jobs.get(cid, [])
@@ -518,6 +529,21 @@ def rank(
                 )
             )
 
+        # §9 — the role census for this company, as evidence. Role rows only; never a name. Empty
+        # in COMPANIES mode (nothing was retrieved from `contact_signal`).
+        contact_evidence = [
+            ContactEvidence(
+                canonical_title=row.get("canonical_title"),
+                function=row.get("function"),
+                seniority=row.get("seniority"),
+                department=row.get("department"),
+                is_big4_alum=bool(row.get("is_big4_alum")),
+                prior_employer=row.get("prior_employer"),
+                landed_at=row.get("landed_at"),
+            )
+            for row in retrieval.company_contacts.get(cid, [])
+        ]
+
         results.append(
             CompanyResult(
                 company_id=cid,
@@ -532,6 +558,8 @@ def rank(
                 hq_country=detail.get("hq_country"),
                 segments=detail.get("segments") or [],
                 linkedin_url=detail.get("linkedin_url"),
+                contact_evidence=contact_evidence,
+                contact_count=retrieval.contact_counts.get(cid, 0),
                 score=score,
                 breakdown=Breakdown(
                     coverage=cov,

@@ -208,10 +208,43 @@
 </div>
 
 {% if not r.companies %}
-  <div class="empty-state">
-    No companies retrieved. Widen the date window or remove a <b class="hard">hard</b> chip —
-    positive terms never filter, so an empty result means a hard filter excluded everything.
-  </div>
+  {% if r.zero_explainer %}
+    {# ---------------------------------------------------------------------------
+       SEARCH-EXPLAINED §10 — the zero-explainer. A bare "no results" reads as "the search is
+       broken". This shows its work: the filters that parsed, the ONE that limited the answer to
+       zero, the coverage number that proves it is a DATA gap (not a search bug), and a
+       relax-a-filter suggestion with its recount. This is a correct, explained zero.
+       --------------------------------------------------------------------------- #}
+    {% set z = r.zero_explainer %}
+    <div class="zero-explainer">
+      <h3>0 companies match — and that is the correct answer.</h3>
+      <div class="zero-row">
+        <span class="zero-tag ok">parsed</span>
+        <span>{{ z.applied|join(' · ') }}</span>
+      </div>
+      <div class="zero-row">
+        <span class="zero-tag ok">applied</span>
+        <span>every filter above fired against all {{ '{:,}'.format(z.universe) }} indexed companies</span>
+      </div>
+      <div class="zero-row">
+        <span class="zero-tag why">why zero</span>
+        <span><b>{{ z.coverage_note }}</b></span>
+      </div>
+      <div class="zero-row">
+        <span class="zero-tag relax">try</span>
+        <span>{{ z.relax_label }} → <b>{{ '{:,}'.format(z.relax_count) }}</b> {{ z.relax_desc }}</span>
+      </div>
+      <p class="hint">
+        This proves more than a fabricated row would: the chips parsed, the filters ran, and the
+        reason is measurable. The data has gaps; the search is correct.
+      </p>
+    </div>
+  {% else %}
+    <div class="empty-state">
+      No companies retrieved. Widen the date window or remove a <b class="hard">hard</b> chip —
+      positive terms never filter, so an empty result means a hard filter excluded everything.
+    </div>
+  {% endif %}
 {% endif %}
 
 {# ---------------------------------------------------------------------------
@@ -278,6 +311,27 @@
       <div class="terms">
         {% for t in b.matched_groups %}<span class="tag hit">✓ {{ t }}</span>{% endfor %}
         {% for t in b.unmatched_groups %}<span class="tag miss">{{ t }}</span>{% endfor %}
+      </div>
+    {% endif %}
+
+    {# ---------------------------------------------------------------------------
+       SEARCH-EXPLAINED §9 — the role census. In PEOPLE mode the matching role is the evidence
+       that this COMPANY answers the query. There are NO names here — contact_signal does not
+       store them — only a seat: "has a VP of Finance Transformation".
+       --------------------------------------------------------------------------- #}
+    {% if co.contact_evidence %}
+      <div class="census">
+        <h4>Role census — {{ co.contact_count }} matching role{{ 's' if co.contact_count != 1 }}
+          (no personal data stored)</h4>
+        {% for p in co.contact_evidence %}
+          <div class="role">
+            <span class="role-title">{{ p.canonical_title or 'role' }}</span>
+            {% if p.function %}<span class="tag fn">{{ p.function|lower }}</span>{% endif %}
+            {% if p.seniority %}<span class="tag sen">{{ p.seniority|lower|replace('_','-') }}</span>{% endif %}
+            {% if p.is_big4_alum %}<span class="tag big4">Big-4 alum{% if p.prior_employer %} · {{ p.prior_employer }}{% endif %}</span>{% endif %}
+            {% if p.landed_at %}<span class="role-date">landed {{ p.landed_at.strftime('%b %Y') }}</span>{% endif %}
+          </div>
+        {% endfor %}
       </div>
     {% endif %}
 

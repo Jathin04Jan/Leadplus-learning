@@ -168,33 +168,41 @@ Source: local Postgres (`leadplus_local`, :5433). **Never query RDS from the app
 | `lead_query` | existing controlled vocabulary (industries etc.) |
 | ~~`lead_contact`~~ | **excluded** — PII, and unnecessary here. Still true; see below. |
 
-### `lead_contact` stays excluded — the decision, and the measurement behind it
+### `lead_contact` is now indexed — a role census (`contact_signal`). See SEARCH-EXPLAINED §9.
 
 CHANGES-v2 §6 proposed indexing a **role census** (`title`, `department`, `seniority`, normalized
-title tokens — never names, emails, phones or LinkedIn) so the app could answer *"manufacturers
-whose CFO arrived from a Big-4 firm"*. **It was skipped**, and §6 of that spec is marked SKIPPED
-rather than deferred. Two gates were run against this corpus first:
+title tokens — never names, emails, phones or LinkedIn) so the app could answer *"companies whose
+CFO arrived from a Big-4 firm"*. It was **skipped** on two gates that measured **zero** — but that
+measurement was taken on the SYNTHETIC seed and was wrong. Re-run on the real clone, both gates
+pass decisively, so the census is now **built**:
 
-| Gate | Question | Result |
-|---|---|---|
-| **A** | Does `apollo_contact_data` carry `employment_history`? | **0 / 518** |
-| **B** | Are there CFO / VP-Finance contacts to return? | **0 / 1,242** |
+| Gate | Question | Synthetic (wrong) | **Real clone** |
+|---|---|---|---|
+| **A** | Does `apollo_contact_data` carry `employment_history`? | 0 / 518 | **4,659 / 36,145** |
+| **B** | Are there CFO / VP-Finance contacts to return? | 0 / 1,242 | **20 CFOs, 906 finance roles, 306 finance leaders (C/VP)** |
 
-Both are zero. "Big-4 alumnus recently landed" is **dead on the data** — the field it needs does
-not exist — and a `PEOPLE` result mode has nothing to return, so it could be neither built
-usefully nor tested honestly. Building it anyway would have meant shipping a feature whose only
-evidence of working was that it compiled.
+`contact_signal` (§7) holds **53,746** role rows across 13,539 canonical companies — a title, a
+`ContactFunction`, a `ContactSeniority`, a department, a Big-4-alumnus flag and the current-role
+start date (`landed_at`), plus a 3072-dim embedding of a role sentence. It stores **no**
+identifying field: no `first_name`, `last_name`, `full_name`, `email`, `phonee164`, `linkedin_url`
+or `notes` — they are never SELECTed, so they cannot leak (`\d contact_signal` is the proof). It
+is the 4th document type (§6), fused through the same company-level RRF, and it is consulted only
+in `PEOPLE` result mode — a `COMPANIES` query retrieves byte-identically to before it existed.
 
-So the position is unchanged and deliberate: **this app indexes companies and job postings.** A
-query about contacts is `UNPARSEABLE` (§1) rather than quietly answered with the company half of
-the question.
+Two things stayed exactly as the exclusion note warned:
+- **Honest caveat:** "the CFO of Acme" is *pseudonymous*, not anonymous — a role is a person when
+  the company is small enough. The census is data-minimised, not de-identified.
+- **`ContactFunction`/`ContactSeniority` are a SEPARATE vocabulary** from the job enums. The job
+  `Function` was **not** widened with `FINANCE`: job enums describe requisitions, people enums
+  describe people, and merging them is how a schema starts lying about what it holds.
 
-**If the real corpus ever lands**, the original design holds and is worth revisiting: reuse
-`lead_contact_normalized_title` (it already carries `canonical_title`/`seniority`/`keywords` —
-that gate passed), ingest the role census and no identifying fields, and note honestly that "the
-CFO of Acme" is *pseudonymous*, not anonymous — a role is a person when the company is small
-enough. Do **not** widen the job `Function` enum with `FINANCE`: job enums describe requisitions,
-not people, and merging the two vocabularies is how a schema starts lying about what it holds.
+Honest limits found on the real data: (1) `lead_contact_normalized_title` is **empty** (0 rows) on
+this clone, so §9's "reuse it" cannot apply — function/seniority are derived deterministically from
+the title text instead. (2) The Big-4 flag comes from a **prior** (non-current) `employment_history`
+employer: 19 such alumni. `employment_history` carries `start_date`, so "recently landed" is real
+(current-role start), but the clone's most-recent starts are ~2022-2024, so "recently" is relative
+to the snapshot. (3) None of the 19 Big-4 alumni also carry a "transformation" current title, so
+that query is satisfied by the OR of the two role signals, not their intersection.
 
 ### `lead_company_job` (relevant columns)
 

@@ -58,6 +58,52 @@ class EngagementType(str, Enum):
     UNKNOWN = "UNKNOWN"
 
 
+# ---------------------------------------------------------------------------
+# SEARCH-EXPLAINED §9 — the CONTACT vocabulary. Deliberately SEPARATE from the job enums above.
+#
+# A job `Function` describes a requisition ("we are hiring ERP work"); a `ContactFunction`
+# describes a person who already works there ("their CFO"). §9 is explicit that these must not be
+# merged — do NOT widen the job `Function` with FINANCE. The two answer different questions and a
+# shared enum would blur which one a row is making a claim about.
+# ---------------------------------------------------------------------------
+
+
+class ContactFunction(str, Enum):
+    FINANCE = "FINANCE"
+    IT = "IT"
+    OPERATIONS = "OPERATIONS"
+    PROCUREMENT = "PROCUREMENT"
+    SALES = "SALES"
+    HR = "HR"
+    LEGAL = "LEGAL"
+    EXECUTIVE = "EXECUTIVE"
+    OTHER = "OTHER"
+
+
+class ContactSeniority(str, Enum):
+    C_LEVEL = "C_LEVEL"
+    VP = "VP"
+    DIRECTOR = "DIRECTOR"
+    MANAGER = "MANAGER"
+    IC = "IC"
+    OTHER = "OTHER"
+
+
+class ResultMode(str, Enum):
+    """SEARCH-EXPLAINED §9 — what the answer is a list OF. The answer is always companies; this
+    only decides what stands as the evidence and whether the contact index is consulted.
+
+    `COMPANIES` — the default. Jobs and company technographics are the evidence. Contacts are not
+                  retrieved, so no existing query changes behaviour.
+    `PEOPLE`    — "find contacts who…", "who are the…". The company is STILL the answer, but the
+                  matching role is the evidence line ("has a VP of Finance Transformation"). No
+                  names are returned — it is a role census projected to the company.
+    """
+
+    COMPANIES = "COMPANIES"
+    PEOPLE = "PEOPLE"
+
+
 class IntentMode(str, Enum):
     """§8.2 — selects the weight profile. Not a filter; it only re-weights the axes.
 
@@ -280,6 +326,40 @@ class CompanySignalRow(BaseModel):
     model: str
 
 
+class ContactSource(BaseModel):
+    """One row of the §9 contact extract — the ROLE fields only.
+
+    Identifying columns (`first_name`, `last_name`, `full_name`, `email`, `phonee164`,
+    `linkedin_url`, `notes`) are NEVER selected by the repository, so they cannot reach this model
+    even by accident — the same discipline `CompanySource` applies to `notes`/`account_summary`.
+    """
+
+    lead_contact_id: int
+    lead_company_id: int
+    title: str | None = None
+    department: str | None = None
+    seniority: str | None = None
+    normalized_title_tokens: list[str] = Field(default_factory=list)
+
+
+class ContactSignalRow(BaseModel):
+    """A `contact_signal` row, ready to upsert. A role census entry — no identity."""
+
+    company_id: int
+    lead_contact_id: int
+    canonical_title: str | None = None
+    seniority: str | None = None
+    function: str | None = None
+    department: str | None = None
+    is_big4_alum: bool = False
+    prior_employer: str | None = None
+    landed_at: dt.date | None = None
+    census_text: str
+    embedding: list[float] | None = None
+    prompt_version: str
+    model: str
+
+
 # ---------------------------------------------------------------------------
 # §6[1] — the query contract. `Chips` is both the LLM parser's structured output
 # and the hand-written input to /api/search/structured.
@@ -373,6 +453,12 @@ class Chips(BaseModel):
     seniority: Seniority | None = None
     intent_mode: IntentMode = IntentMode.EITHER
 
+    # SEARCH-EXPLAINED §9 — selects whether the CONTACT index is consulted and what the evidence
+    # line is. Like `intent_mode`, it is a mode, not a predicate: it never removes a company and it
+    # is excluded from `is_empty()`. A `PEOPLE` query still needs a real predicate (the role words
+    # land in `terms`), so the empty-parse guard still fires.
+    result_mode: ResultMode = ResultMode.COMPANIES
+
     # Beyond §6[1]'s listing, but required by rule 2 / §6[2], which name employee and revenue
     # range as the other two hard filters. §6[1]'s Chips has no field to carry them.
     min_employees: int | None = None
@@ -439,6 +525,23 @@ class Evidence(BaseModel):
     days_ago: int | None = None
 
 
+class ContactEvidence(BaseModel):
+    """SEARCH-EXPLAINED §9 — one ROLE as the reason a company matched a PEOPLE query.
+
+    This is the evidence line, not a lead. It carries a title, a function and a seniority and
+    **no name, email, phone or LinkedIn** — there is nowhere for those to come from, because
+    `contact_signal` does not store them. "has a VP of Finance Transformation" is the whole claim.
+    """
+
+    canonical_title: str | None = None
+    function: str | None = None
+    seniority: str | None = None
+    department: str | None = None
+    is_big4_alum: bool = False
+    prior_employer: str | None = None
+    landed_at: dt.date | None = None
+
+
 class Breakdown(BaseModel):
     """§8.6's inputs, itemised — the four axes, their weights, and the multiplier.
 
@@ -501,6 +604,30 @@ class CompanyResult(BaseModel):
     segments: list[str] = Field(default_factory=list)
     linkedin_url: str | None = None
 
+    # SEARCH-EXPLAINED §9 — the role census for a PEOPLE query: the matching roles at THIS company,
+    # as evidence. Empty in COMPANIES mode. Never carries a name.
+    contact_evidence: list[ContactEvidence] = Field(default_factory=list)
+    contact_count: int = 0
+
+
+class ZeroReason(BaseModel):
+    """SEARCH-EXPLAINED §10 — why a SEARCH returned zero, with the measured coverage number.
+
+    A bare "no results" reads as "the search is broken". This shows its work instead: the filters
+    that applied, the ONE that limited the result to zero (with the coverage figure that proves the
+    data gap, not a search bug), and a relax-a-filter suggestion with its recount. It is only ever
+    set on an honest zero — a refusal has its own message and never reaches here.
+    """
+
+    universe: int  # retrievable companies (the denominator every percentage is over)
+    applied: list[str] = Field(default_factory=list)  # the filters that fired, in plain words
+    limiter_label: str  # e.g. "NAICS 334111"
+    limiter_only_count: int  # companies matching ONLY the limiter — the "0 of N" number
+    coverage_note: str  # "only 8.5% of companies carry any NAICS code"
+    relax_label: str  # "Drop NAICS"
+    relax_count: int  # companies remaining once the limiter is dropped
+    relax_desc: str  # "companies in Texas" — what the remaining filters still select
+
 
 class SearchResponse(BaseModel):
     chips: Chips
@@ -519,3 +646,12 @@ class SearchResponse(BaseModel):
     # `companies` is empty **because we refused**, not because nothing matched. The UI must render
     # the difference; an empty list is exactly the silent failure this field exists to end.
     refusal: str | None = None
+
+    # SEARCH-EXPLAINED §10 — set when a SEARCH returned zero companies (NOT a refusal). Explains
+    # WHY zero, with the limiting filter's coverage number and a relax suggestion. None when there
+    # are results, or when there is no hard filter to blame.
+    zero_explainer: ZeroReason | None = None
+
+    # SEARCH-EXPLAINED §9 — echoed back so the UI can say a PEOPLE query was answered as a role
+    # census. The answer is still companies; this only labels how they were found.
+    result_mode: ResultMode = ResultMode.COMPANIES

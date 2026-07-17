@@ -30,6 +30,8 @@ from .models import (
     CanonicalCompany,
     CompanySignalRow,
     CompanySource,
+    ContactSignalRow,
+    ContactSource,
     JobIntentRow,
     JobSignalRow,
     JobSource,
@@ -88,6 +90,7 @@ def health(conn: psycopg.Connection) -> dict[str, Any]:
         "job_signal",
         "job_intent",
         "company_signal",
+        "contact_signal",
         "tech_canonical",
         "tech_review_queue",
         "location_alias",
@@ -1442,6 +1445,189 @@ def industry_histogram(conn: psycopg.Connection) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# SEARCH-EXPLAINED §9 — the contact role census (`contact_signal`).
+#
+# READ-ONLY on `lead_contact` and `apollo_contact_data` (both are on LEADPLUS_TABLES /
+# another-team territory). The ROLE columns are selected; the IDENTIFYING ones
+# (`first_name`, `last_name`, `full_name`, `email`, `phonee164`, `linkedin_url`, `notes`) are
+# NEVER named in any query here — the same discipline `fetch_companies_to_normalize` applies to
+# `notes`/`account_summary`. You cannot leak a column you never SELECT.
+# ---------------------------------------------------------------------------
+
+
+def count_indexable_contacts(conn: psycopg.Connection) -> int:
+    """Active contacts attached to a company — the ingest denominator.
+
+    Scope (§9): contacts whose `lead_company_id` is a member of some `company_canonical` group.
+    The membership check is done in Python from `canonical_member_map` during ingest (an
+    `ANY(member_ids)` join here is a seq-scan trap), so this count is the looser "active + has a
+    company" and the real figure is reported by the ingest after mapping.
+    """
+    row = conn.execute(
+        "SELECT count(*) AS n FROM lead_contact WHERE active AND lead_company_id IS NOT NULL"
+    ).fetchone()
+    return row["n"]  # type: ignore[index]
+
+
+def fetch_big4_apollo_data(conn: psycopg.Connection) -> list[dict[str, Any]]:
+    """Every Apollo blob that carries an `employment_history` — loaded ONCE, parsed in Python.
+
+    Only 4,659 of 36,145 blobs have employment history, so this is a single cheap scan up front
+    rather than a per-contact lateral subquery (their table has no index on `lead_contact_id`, so
+    a per-batch join would seq-scan 36k rows 500+ times). The parse — Big-4 alum + landing date —
+    lives in `contacts.big4_history`; this only fetches.
+    """
+    return conn.execute(
+        """
+        SELECT DISTINCT ON (lead_contact_id) lead_contact_id, data
+        FROM apollo_contact_data
+        WHERE data LIKE '%%employment_history%%'
+        ORDER BY lead_contact_id, fetched_at DESC NULLS LAST, id DESC
+        """
+    ).fetchall()
+
+
+def fetch_contacts_to_index(
+    conn: psycopg.Connection,
+    *,
+    cursor: int,
+    prompt_version: str,
+    model: str,
+    limit: int = config.FETCH_BATCH_SIZE,
+) -> list[ContactSource]:
+    """§9 stage 1 — the ROLE fields only, keyset-paginated, with the §5.7 NOT EXISTS resumability.
+
+    Selects `title`, `department`, `seniority`, `normalized_title_tokens`, `lead_contact_id`,
+    `lead_company_id` — and NOTHING that identifies the person. The already-written rows are the
+    checkpoint, exactly as `fetch_jobs_to_normalize`.
+    """
+    rows = conn.execute(
+        """
+        SELECT lc.id AS lead_contact_id, lc.lead_company_id, lc.title, lc.department,
+               lc.seniority, lc.normalized_title_tokens
+        FROM lead_contact lc
+        WHERE lc.active AND lc.lead_company_id IS NOT NULL
+          AND lc.id > %(cursor)s
+          AND NOT EXISTS (
+            SELECT 1 FROM contact_signal s
+            WHERE s.lead_contact_id = lc.id
+              AND s.prompt_version = %(prompt_version)s AND s.model = %(model)s
+          )
+        ORDER BY lc.id
+        LIMIT %(limit)s
+        """,
+        {"cursor": cursor, "prompt_version": prompt_version, "model": model, "limit": limit},
+    ).fetchall()
+    out: list[ContactSource] = []
+    for r in rows:
+        r = dict(r)
+        r["normalized_title_tokens"] = r.get("normalized_title_tokens") or []
+        out.append(ContactSource(**r))
+    return out
+
+
+def upsert_contact_signals(conn: psycopg.Connection, rows: Sequence[ContactSignalRow]) -> int:
+    """Single upsert keyed on `lead_contact_id` (§5.7) — one census row per contact."""
+    if not rows:
+        return 0
+    params = [
+        (
+            r.company_id,
+            r.lead_contact_id,
+            r.canonical_title,
+            r.seniority,
+            r.function,
+            r.department,
+            r.is_big4_alum,
+            r.prior_employer,
+            r.landed_at,
+            r.census_text,
+            _vec(r.embedding),
+            r.prompt_version,
+            r.model,
+        )
+        for r in rows
+    ]
+    with conn.transaction(), conn.cursor() as cur:
+        cur.executemany(
+            """
+            INSERT INTO contact_signal (
+              company_id, lead_contact_id, canonical_title, seniority, function, department,
+              is_big4_alum, prior_employer, landed_at, census_text, embedding,
+              prompt_version, model, run_at
+            ) VALUES (
+              %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector, %s, %s, now()
+            )
+            ON CONFLICT (lead_contact_id) DO UPDATE SET
+              company_id     = EXCLUDED.company_id,
+              canonical_title= EXCLUDED.canonical_title,
+              seniority      = EXCLUDED.seniority,
+              function       = EXCLUDED.function,
+              department     = EXCLUDED.department,
+              is_big4_alum   = EXCLUDED.is_big4_alum,
+              prior_employer = EXCLUDED.prior_employer,
+              landed_at      = EXCLUDED.landed_at,
+              census_text    = EXCLUDED.census_text,
+              embedding      = EXCLUDED.embedding,
+              prompt_version = EXCLUDED.prompt_version,
+              model          = EXCLUDED.model,
+              run_at         = now()
+            """,
+            params,
+        )
+    return len(rows)
+
+
+def contact_counts(conn: psycopg.Connection) -> dict[str, Any]:
+    """The §9 acceptance proof: rows, embedding presence, dims, reach, and the Big-4 tally."""
+    return conn.execute(
+        """
+        SELECT
+          (SELECT count(*) FROM contact_signal)                                     AS rows,
+          (SELECT count(*) FROM contact_signal WHERE embedding IS NULL)             AS no_embedding,
+          (SELECT count(DISTINCT vector_dims(embedding)) FROM contact_signal
+             WHERE embedding IS NOT NULL)                                           AS dim_variants,
+          (SELECT max(vector_dims(embedding)) FROM contact_signal)                  AS dims,
+          (SELECT count(DISTINCT company_id) FROM contact_signal)                   AS companies,
+          (SELECT count(*) FROM contact_signal WHERE is_big4_alum)                  AS big4_alumni,
+          (SELECT count(*) FROM contact_signal WHERE function = 'FINANCE')          AS finance,
+          (SELECT count(*) FROM contact_signal
+             WHERE function = 'FINANCE' AND seniority IN ('C_LEVEL','VP'))          AS finance_leaders
+        """
+    ).fetchone()  # type: ignore[return-value]
+
+
+def orphan_contact_signals(conn: psycopg.Connection) -> int:
+    """§5.4 invariant: every `contact_signal.company_id` is a canonical id."""
+    row = conn.execute(
+        """
+        SELECT count(*) AS n FROM contact_signal s
+        WHERE NOT EXISTS (SELECT 1 FROM company_canonical cc WHERE cc.canonical_id = s.company_id)
+        """
+    ).fetchone()
+    return row["n"]  # type: ignore[index]
+
+
+def contact_pii_columns(conn: psycopg.Connection) -> list[str]:
+    """PROOF for §9's acceptance: any identifying column on `contact_signal`. Must be empty.
+
+    Reads the catalog rather than trusting the DDL — the guarantee is "the live table has no
+    name/email/phone/linkedin column", and the catalog is where that is true or false.
+    """
+    rows = conn.execute(
+        """
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name = 'contact_signal'
+          AND (column_name ~* '(first|last|full).*name'
+               OR column_name ~* 'name$' AND column_name !~* 'employer|title'
+               OR column_name ~* 'email|phone|linkedin|mobile')
+        ORDER BY column_name
+        """
+    ).fetchall()
+    return [r["column_name"] for r in rows]
+
+
+# ---------------------------------------------------------------------------
 # §6 — retrieval. NO LLM below this line; these four lists are pure SQL.
 #
 # Three things are load-bearing in every query here:
@@ -1786,6 +1972,202 @@ def search_companies_semantic(
         """,
         {"qvec": _vec(qvec), "limit": limit, **filters},
     ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# SEARCH-EXPLAINED §9 — the contact retrieval lists (L7, L8). The 4th document type.
+#
+# Company-level by construction: a company has many contacts, so each list takes the BEST contact
+# per company (`DISTINCT ON (company_id)`) and returns one row per company. That is the contact
+# analogue of the intent lists' "best row per job" — it stops a company with 50 finance staff from
+# collecting 50 RRF contributions for what is one piece of evidence ("they have finance leadership").
+#
+# Applies `_FIRMO_FILTERS` and `_FACT_FILTERS` (industry, location, segment, size, revenue) but NOT
+# `_JOB_FILTERS`: a contact has no `posted_date`, and the job `function`/`seniority` enums describe
+# requisitions, not people (§9). The role itself is matched via the query phrases / embedding here.
+# ---------------------------------------------------------------------------
+
+
+def search_contacts_lexical(
+    conn: psycopg.Connection, *, phrases: Sequence[str], filters: dict[str, Any], limit: int = 200
+) -> list[dict[str, Any]]:
+    """List L7 — `ts_rank` over `contact_signal.tsv` (the census sentence), best contact per company."""
+    return conn.execute(
+        _TSQUERY_CTE
+        + f"""
+        SELECT company_id, score FROM (
+          SELECT DISTINCT ON (cs.company_id)
+                 cs.company_id, ts_rank(cs.tsv, q.query) AS score
+          FROM contact_signal cs
+          JOIN lead_company c ON c.id = cs.company_id
+          CROSS JOIN q
+          WHERE q.query IS NOT NULL
+            AND cs.tsv @@ q.query
+            {_FIRMO_FILTERS}
+            {_FACT_FILTERS}
+          ORDER BY cs.company_id, score DESC, cs.id
+        ) t
+        ORDER BY score DESC, company_id
+        LIMIT %(limit)s
+        """,
+        {"phrases": list(phrases), "limit": limit, **filters},
+    ).fetchall()
+
+
+def search_contacts_semantic(
+    conn: psycopg.Connection, *, qvec: Sequence[float], filters: dict[str, Any], limit: int = 200
+) -> list[dict[str, Any]]:
+    """List L8 — exact cosine over `contact_signal.embedding`, best contact per company. No ANN (rule 7)."""
+    return conn.execute(
+        f"""
+        SELECT company_id, score FROM (
+          SELECT DISTINCT ON (cs.company_id)
+                 cs.company_id, 1 - (cs.embedding <=> %(qvec)s::vector) AS score
+          FROM contact_signal cs
+          JOIN lead_company c ON c.id = cs.company_id
+          WHERE cs.embedding IS NOT NULL
+            {_FIRMO_FILTERS}
+            {_FACT_FILTERS}
+          ORDER BY cs.company_id, cs.embedding <=> %(qvec)s::vector, cs.id
+        ) t
+        ORDER BY score DESC, company_id
+        LIMIT %(limit)s
+        """,
+        {"qvec": _vec(qvec), "limit": limit, **filters},
+    ).fetchall()
+
+
+def fetch_contacts_for_companies(
+    conn: psycopg.Connection,
+    *,
+    company_ids: Sequence[int],
+    phrases: Sequence[str],
+    limit_per_company: int = 5,
+) -> list[dict[str, Any]]:
+    """The role census for the candidate companies — §9's evidence, grouped by company.
+
+    Returns ROLE rows only (title, function, seniority, department, Big-4 flag, landing date) —
+    NEVER a name. When `phrases` are given, only the contacts whose census matches them are
+    returned (so a finance query shows finance roles, not the whole org chart); otherwise every
+    contact is eligible. Ranked C-level-first within a company so the strongest evidence shows.
+
+    `limit_per_company` is applied with a window function so one big company cannot flood the
+    payload — a census is a summary, not a dump.
+    """
+    if not company_ids:
+        return []
+    # A phrase filter, built exactly like `_TSQUERY_CTE` so it lexes/escapes identically. When no
+    # phrases are asked, every row qualifies (the query is TRUE).
+    return conn.execute(
+        """
+        WITH parts AS (
+          SELECT plainto_tsquery('english', p) AS t FROM unnest(%(phrases)s::text[]) AS p
+        ), q AS (
+          SELECT to_tsquery('english', string_agg('(' || t::text || ')', ' | ' ORDER BY t::text)) AS query
+          FROM parts WHERE t::text <> ''
+        ), ranked AS (
+          SELECT cs.company_id, cs.canonical_title, cs.function, cs.seniority, cs.department,
+                 cs.is_big4_alum, cs.prior_employer, cs.landed_at,
+                 row_number() OVER (
+                   PARTITION BY cs.company_id
+                   ORDER BY
+                     CASE cs.seniority WHEN 'C_LEVEL' THEN 0 WHEN 'VP' THEN 1 WHEN 'DIRECTOR' THEN 2
+                          WHEN 'MANAGER' THEN 3 WHEN 'IC' THEN 4 ELSE 5 END,
+                     cs.is_big4_alum DESC, cs.id
+                 ) AS rn
+          FROM contact_signal cs
+          CROSS JOIN q
+          WHERE cs.company_id = ANY(%(ids)s::bigint[])
+            AND (q.query IS NULL OR cs.tsv @@ q.query)
+        )
+        SELECT company_id, canonical_title, function, seniority, department,
+               is_big4_alum, prior_employer, landed_at
+        FROM ranked
+        WHERE rn <= %(cap)s
+        ORDER BY company_id, rn
+        """,
+        {"ids": list(company_ids), "phrases": list(phrases), "cap": limit_per_company},
+    ).fetchall()
+
+
+def count_company_contacts(
+    conn: psycopg.Connection, *, company_ids: Sequence[int], phrases: Sequence[str]
+) -> dict[int, int]:
+    """How many matching roles each company has — the "N finance roles" number on the card."""
+    if not company_ids:
+        return {}
+    rows = conn.execute(
+        """
+        WITH parts AS (
+          SELECT plainto_tsquery('english', p) AS t FROM unnest(%(phrases)s::text[]) AS p
+        ), q AS (
+          SELECT to_tsquery('english', string_agg('(' || t::text || ')', ' | ' ORDER BY t::text)) AS query
+          FROM parts WHERE t::text <> ''
+        )
+        SELECT cs.company_id, count(*) AS n
+        FROM contact_signal cs CROSS JOIN q
+        WHERE cs.company_id = ANY(%(ids)s::bigint[])
+          AND (q.query IS NULL OR cs.tsv @@ q.query)
+        GROUP BY cs.company_id
+        """,
+        {"ids": list(company_ids), "phrases": list(phrases)},
+    ).fetchall()
+    return {r["company_id"]: r["n"] for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# SEARCH-EXPLAINED §10 — the zero-explainer's counting primitives.
+#
+# The retrievable universe is `company_signal JOIN lead_company`: `company_semantic` always returns
+# every company passing the fact/firmo filters (up to 200), so `candidates == 0` is EXACTLY
+# "0 companies pass the hard filters". These counts re-run that same predicate with one filter
+# neutralised at a time — cheap over 22,876 rows, no index needed.
+# ---------------------------------------------------------------------------
+
+
+def count_companies_passing(conn: psycopg.Connection, filters: dict[str, Any]) -> int:
+    """Companies in the retrievable universe passing `_FIRMO_FILTERS` + `_FACT_FILTERS`.
+
+    Takes a filters dict shaped exactly like the retrieval ones, so a caller neutralises a
+    dimension by zeroing its parameter (`naics=[]`, `min_employees=None`, …) and calls this — the
+    same SQL the search runs, minus one predicate. Identical predicate = an honest recount.
+    """
+    row = conn.execute(
+        f"""
+        SELECT count(*) AS n
+        FROM company_signal cs
+        JOIN lead_company c ON c.id = cs.company_id
+        WHERE TRUE
+          {_FIRMO_FILTERS}
+          {_FACT_FILTERS}
+        """,
+        filters,
+    ).fetchone()
+    return row["n"]  # type: ignore[index]
+
+
+def field_coverage(conn: psycopg.Connection) -> dict[str, Any]:
+    """How many retrievable companies carry ANY value for each filterable field — §10's coverage %.
+
+    "0 of 22,876 carry NAICS 334111" is the limiter count; "only 8.5% carry any NAICS code" is the
+    reason, and it comes from here. One scan over the retrievable universe.
+    """
+    return conn.execute(
+        """
+        SELECT
+          count(*)                                                              AS universe,
+          count(*) FILTER (WHERE coalesce(cardinality(c.naics_codes), 0) > 0)   AS has_naics,
+          count(*) FILTER (WHERE coalesce(cardinality(c.sic_codes), 0) > 0)     AS has_sic,
+          count(*) FILTER (WHERE c.revenue_usd IS NOT NULL)                     AS has_revenue,
+          count(*) FILTER (WHERE coalesce(cardinality(c.segments), 0) > 0)      AS has_segments,
+          count(*) FILTER (WHERE c.linkedin_url IS NOT NULL)                    AS has_linkedin,
+          count(*) FILTER (WHERE c.hq_state IS NOT NULL OR c.hq_city IS NOT NULL
+                                 OR c.hq_country IS NOT NULL)                   AS has_location,
+          count(*) FILTER (WHERE cs.industry_canonical IS NOT NULL)            AS has_industry
+        FROM company_signal cs
+        JOIN lead_company c ON c.id = cs.company_id
+        """
+    ).fetchone()  # type: ignore[return-value]
 
 
 def fetch_company_details(
