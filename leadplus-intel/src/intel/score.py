@@ -393,18 +393,17 @@ def industry_multiplier(
     """
     if not asked:
         return 1.00, "no industry asked"
-    if strict:
-        return 1.00, f"industry_strict: hard-filtered on {', '.join(asked)}, multiplier skipped"
-    wanted = {a.strip().lower() for a in asked if a.strip()}
-    if industry_canonical and industry_canonical.strip().lower() in wanted:
-        return 1.00, f"canonical hit: {industry_canonical}"
-    if similarity is not None and similarity > tuning.near_threshold:
-        return (
-            tuning.near_multiplier,
-            f"near match: best cosine {similarity:.3f} > {tuning.near_threshold}",
-        )
-    detail = f"best cosine {similarity:.3f}" if similarity is not None else "no industry embedding"
-    return tuning.far_multiplier, f"down-weighted, not dropped ({detail})"
+    # Task 2 — the soft multiplier is RETIRED. `industry` is a fact (a 95-value taxonomy), so it
+    # is now a hard filter expanded through `industry_alias` (`retrieve._expand_industries`), and
+    # every company that reaches scoring is already a member of the asked family. There is nothing
+    # left to down-weight: the 0.35 "far" tier existed to demote the wrong-industry companies that
+    # a soft multiplier could not remove, and they are removed now. Applying a multiplier on top
+    # would penalise a `Machinery Manufacturing` company for not being spelled `Manufacturing` —
+    # exactly the taxonomy gap the expansion closes. So it returns 1.00, and the near/far tiers and
+    # `similarity` are no longer read on the ranking path (they remain in the `Breakdown` as
+    # information — `industry_similarity` still says how close the raw strings sit).
+    verb = "exact value" if strict else "expanded taxonomy set"
+    return 1.00, f"industry hard-filtered ({verb}); soft multiplier retired (Task 2)"
 
 
 # ---------------------------------------------------------------------------

@@ -155,7 +155,7 @@ AND NOT (lower(c.hq_state) = ANY(%(loc_neg)s) OR lower(c.hq_city) = ANY(%(loc_ne
 All ride the existing join. **Zero LLM cost — facts, not derived signal.**
 
 ```python
-segments: list[str] = []          # HARD. Closed set: Enterprise | Mid-Market | SMB
+segments: list[str] = []          # HARD. Closed set — SEE THE CORRECTION BELOW, it is NOT sizes
 naics: list[str] = []             # HARD. array overlap on c.naics_codes
 sic: list[str] = []               # HARD. array overlap on c.sic_codes
 has_linkedin: bool | None = None  # HARD. a NULL check is exact
@@ -163,6 +163,36 @@ has_linkedin: bool | None = None  # HARD. a NULL check is exact
 
 Architecturally consistent, not rule violations: rule 2 says *filter on facts*. `industry` stays soft
 **because it is free text** — the rule was never "don't filter", it was "don't filter on fuzzy things".
+
+### ⚠️ CORRECTION — `segments` was built on a fiction, and "mid-market" could never match
+
+This section asserted `segments` is `Enterprise | Mid-Market | SMB`. **Not one of those three
+values exists in `lead_company.segments[]`.** Measured on the real corpus (active, real companies):
+
+| Real segment value | Companies |
+|---|---|
+| `General` | 17,270 |
+| `Automate26` | 6,101 |
+| `Robotics` | 258 |
+| `Food Equipment` | 89 |
+| `Medical` | 60 |
+| `Logistics` | 6 |
+
+They are **trade-show / product-line categories, not size bands.** So the §7 parser rule
+"mid-market → `Mid-Market`" emitted a hard-filter value that matched **zero** rows — every
+"mid-market" query silently returned an empty set, the §1 disease with a fresh mask. `SMB` and
+`Enterprise` were equally dead.
+
+**The decision (Task 3): `segments` is remapped to the six real values, and size words emit no
+segment at all.** There is no honest mapping from "mid-market" onto `General`/`Automate26`/…, so
+the parser must not invent one. Size intent is carried by `min_employees`/`max_employees`/revenue
+when the user gives a number, and by nothing when they give only a vague band word — the same rule
+those fields already enforce ("mid-size" is an adjective, not a filter). `segments` now only fires
+when the user names one of the six categories ("companies in the Robotics segment"). See
+`prompts/query_parser.md`'s `segments` section. The consequence for the acceptance sheet:
+"mid-market companies in Illinois or Ohio…" drops the dead segment chip and is carried by
+its location + employee + revenue facts, which is why it returns real IL/OH companies instead of
+an empty page.
 
 ## 5. `industry_strict` — let the user override the default
 

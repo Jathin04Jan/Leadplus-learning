@@ -147,7 +147,6 @@ SEED_INDUSTRY: dict[str, list[str]] = {
         "Transportation, Logistics, Supply Chain and Storage",
         "Logistics",
         "Warehousing and Storage",
-        "Truck Transportation",
         "Maritime Transportation",
     ],
     "supply chain": [
@@ -157,14 +156,12 @@ SEED_INDUSTRY: dict[str, list[str]] = {
     ],
     "transportation": [
         "Transportation, Logistics, Supply Chain and Storage",
-        "Truck Transportation",
         "Maritime Transportation",
         "Airlines and Aviation",
     ],
     "shipping": [
         "Transportation, Logistics, Supply Chain and Storage",
         "Maritime Transportation",
-        "Truck Transportation",
     ],
     "warehousing": ["Warehousing and Storage", "Transportation, Logistics, Supply Chain and Storage"],
     "healthcare": [
@@ -184,9 +181,9 @@ SEED_INDUSTRY: dict[str, list[str]] = {
     "pharma": ["Pharmaceutical Manufacturing"],
     "pharmaceutical": ["Pharmaceutical Manufacturing"],
     "pharmaceuticals": ["Pharmaceutical Manufacturing"],
-    "life sciences": ["Pharmaceutical Manufacturing", "Biotechnology Research", "Biotechnology"],
-    "biotech": ["Biotechnology Research", "Biotechnology"],
-    "biotechnology": ["Biotechnology Research", "Biotechnology"],
+    "life sciences": ["Pharmaceutical Manufacturing", "Biotechnology Research"],
+    "biotech": ["Biotechnology Research"],
+    "biotechnology": ["Biotechnology Research"],
     # `Tech`/`Technology` is a real user word for a real taxonomy value. It is seeded because it
     # maps HONESTLY, unlike `Enterprise` — which is a size word, is not an industry, is not a
     # segment on this corpus either, and is therefore deliberately absent from this file.
@@ -290,27 +287,37 @@ def build_rows(corpus: list[str]) -> tuple[list[tuple[str, str, str]], list[str]
     """
     by_key = {industry_key(value): value for value in corpus}
 
-    rows: set[tuple[str, str, str]] = set()
+    # Keyed on (alias, canonical) — the table's own primary key — rather than collected as a set
+    # of 3-tuples. `kind` is not part of that key, so a set of triples happily holds
+    # ('manufacturing', 'Manufacturing', 'exact') AND ('manufacturing', 'Manufacturing', 'family'):
+    # both claims are true (it is the self-mapping *and* a member of the family it names), and both
+    # collapse to one row on insert. The count assertion in `main` caught exactly that. Building on
+    # the real key is the fix; making the assertion lenient would have been the bug.
+    kinds: dict[tuple[str, str], str] = {}
     unknown: list[str] = []
 
     # -- the exact self-mappings, from the corpus itself ------------------------------------
     for value in corpus:
-        rows.add((industry_key(value), value, "exact"))
+        kinds[(industry_key(value), value)] = "exact"
 
     # -- the seeded family words -------------------------------------------------------------
+    family_members: set[str] = set()
     for alias, values in SEED_INDUSTRY.items():
         for value in values:
             actual = by_key.get(industry_key(value))
             if actual is None:
                 unknown.append(f"{alias!r} -> {value!r}")
                 continue
+            family_members.add(actual)
             # `actual`, not `value`: the corpus's own spelling wins, because that is what
             # `company_signal.industry_canonical` holds and what the filter compares against.
-            rows.add((industry_key(alias), actual, "family"))
+            # `setdefault`, so an existing 'exact' claim is not relabelled — a self-mapping is the
+            # stronger statement and the one worth reading in the table.
+            kinds.setdefault((industry_key(alias), actual), "family")
 
-    covered = {canonical for _alias, canonical, kind in rows if kind == "family"}
-    uncovered = sorted(v for v in corpus if v not in covered)
-    return sorted(rows), unknown, uncovered
+    rows = sorted((alias, canonical, kind) for (alias, canonical), kind in kinds.items())
+    uncovered = sorted(v for v in corpus if v not in family_members)
+    return rows, unknown, uncovered
 
 
 def main() -> int:

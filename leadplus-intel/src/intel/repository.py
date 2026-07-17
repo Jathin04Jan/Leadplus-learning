@@ -1302,12 +1302,19 @@ def distinct_company_industries(conn: psycopg.Connection) -> list[dict[str, Any]
     The counts come back because they are the argument. "manufacturing" covering 11,032 companies
     across 25 taxonomy values, versus `industry = 'Manufacturing'` covering 1,067, is not a fact
     anyone should have to take on trust from a comment.
+
+    `FIXTURE_PREDICATE` is applied, and it has to be: the `.example` fixtures carry **10 industry
+    values no real company has** (`Chemicals`, `Consumer Goods`, `Energy`, `Agriculture`, …), and
+    they are excluded at the fold, so nothing downstream can ever be indexed under them. Seeding
+    an alias for one would produce a filter value that matches zero rows forever — a dead alias
+    that reads as working. 105 values with the fixtures, **95** without; the 95 are the taxonomy.
     """
     return conn.execute(
-        """
+        f"""
         SELECT trim(industry) AS value, count(*) AS n
         FROM lead_company
-        WHERE active AND industry IS NOT NULL AND trim(industry) <> ''
+        WHERE active AND {FIXTURE_PREDICATE}
+          AND industry IS NOT NULL AND trim(industry) <> ''
         GROUP BY 1
         ORDER BY 2 DESC, 1
         """

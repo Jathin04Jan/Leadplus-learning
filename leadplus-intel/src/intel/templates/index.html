@@ -258,10 +258,11 @@
 
   <div class="lab">
     <b>Lab environment — not production.</b>
-    The corpus is a <b>synthetic replica</b> (386 job postings across 301 companies), so results
-    demonstrate that the architecture works; they say nothing about real-world relevance.
-    There is <b>no auth, no multi-tenancy and no data-pack gating</b> — every company in the pool is
-    visible to you. A real tenant would see a gated subset.
+    Real data: a read-only clone of <b>leadplus_dev</b> — <b>22,941 companies</b>, with hiring-intent
+    extracted from <b>2,761 job postings</b>. Coverage is uneven and honest: firmographics on ~100%,
+    Apollo technographics on ~12%, job postings on ~2% — so a tech-stack or intent query searches a
+    smaller pool than a location or size query. There is <b>no auth, no multi-tenancy and no
+    data-pack gating</b> — every company is visible to you; a real tenant would see a gated subset.
   </div>
 
   <form class="search" hx-post="/ui/search" hx-target="#results" hx-swap="innerHTML"
@@ -274,12 +275,12 @@
 
   <p class="examples">
     Try:
-    <button onclick="demo('SAP manufacturing companies using Snowflake and AWS')">SAP manufacturers using Snowflake and AWS</button>·
-    <button onclick="demo('companies using Snowflake and AWS, exclude anything already on S/4HANA')">…excluding S/4HANA</button>·
-    <button onclick="demo('SAP and also AWS or Azure')">SAP and also AWS or Azure</button>·
-    <button onclick="demo('mid-market companies in Illinois or Ohio')">mid-market in Illinois or Ohio</button>·
-    <button onclick="demo('SAP shops hiring dbt engineers')">SAP shops hiring dbt engineers</button>·
-    <button onclick="demo('create a 3-step campaign for these companies')">create a 3-step campaign</button>
+    <button onclick="demo('companies hiring for ERP migration')">companies hiring for ERP migration</button>·
+    <button onclick="demo('companies running legacy SAP ECC who need an upgrade route')">legacy SAP ECC upgrade candidates</button>·
+    <button onclick="demo('accounts that run SAP and also have AWS or Azure listed in their tech stack')">SAP and also (AWS or Azure)</button>·
+    <button onclick="demo('supply chain companies with an enterprise ERP footprint that isn\'t Oracle')">supply-chain ERP that isn't Oracle</button>·
+    <button onclick="demo('companies modernizing their cloud infrastructure')">modernizing cloud infrastructure</button>·
+    <button onclick="demo('create a 3-step campaign for these companies')">create a 3-step campaign (refuses)</button>
   </p>
 
   <div id="results">

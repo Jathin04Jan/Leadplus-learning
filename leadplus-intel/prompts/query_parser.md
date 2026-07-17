@@ -1,6 +1,6 @@
 ---
 name: query_parser
-version: v2
+version: v3
 model: gpt-4.1-mini
 schema: intel.models.Chips
 description: Parse one natural-language search query into Chips (ARCHITECTURE.md §6[1], §9; CHANGES-v2 §1, §7).
@@ -83,6 +83,7 @@ Each group is **one requirement**. Within a group, `any_of` lists alternates tha
 |---|---|
 | "SAP and also AWS or Azure" | `[{any_of:[SAP]}, {any_of:[AWS, Azure]}]` — 2 groups |
 | "Snowflake and AWS" | `[{any_of:[Snowflake]}, {any_of:[AWS]}]` — 2 groups |
+| "both Salesforce and Zoho" | `[{any_of:[Salesforce]}, {any_of:[Zoho]}]` — **2 groups** |
 | "Snowflake or Databricks" | `[{any_of:[Snowflake, Databricks]}]` — **1** group |
 | "Snowflake and AWS, exclude S/4HANA" | `[{any_of:[Snowflake]}, {any_of:[AWS]}, {any_of:[SAP S/4HANA], negate:true}]` |
 
@@ -91,6 +92,11 @@ Grouping rules:
   will do; do not split them into two requirements they must both satisfy.
 - **"and", "and also", ", " between requirements → a new group each.** "and" is not a mode switch,
   it is how English joins a list of separate requirements.
+- **"both X and Y" → TWO groups, never one.** The word "both" is the user insisting on the
+  conjunction — they want companies that have X *and* Y, so it is the strongest possible signal
+  for two separate requirements. Putting `[X, Y]` in one `any_of` would make it an OR ("either X
+  or Y"), which is the exact opposite of "both". "companies that list both Salesforce and Zoho" is
+  `[{any_of:[Salesforce]}, {any_of:[Zoho]}]` — a company needs both to cover 2/2.
 - Do not nest. One level only. If a query genuinely needs more, flatten it to the closest
   reading and let the user fix the chips.
 
@@ -101,7 +107,13 @@ normalizer, so the two sides can be compared (this is why the corpus was normali
 
 **Include** — specific, named, buyable-or-installable things:
 - Products and platforms: `SAP`, `SAP S/4HANA`, `Snowflake`, `Salesforce`, `NetSuite`, `Workday`
+- **Legacy / versioned ERP products, which are named products in their own right and MUST be
+  extracted**: `SAP ECC`, `SAP ERP`, `SAP R/3`, `Oracle E-Business Suite`, `Oracle ERP`. A word
+  like "legacy" or "old" in front of one of these is a *description of the product*, not a reason
+  to skip it — "running legacy SAP ECC" is a query for companies on `SAP ECC`. Keep the exact
+  granularity: `SAP ECC` is **not** `SAP` and is **not** `SAP S/4HANA`; emit `SAP ECC`.
 - Cloud services: `AWS`, `Microsoft Azure`, `Google Cloud Platform`, `BigQuery`, `Redshift`
+- CRM/business apps by name: `Salesforce`, `Zoho`, `HubSpot`, `Microsoft Dynamics 365`, `Oracle`
 - Databases and engines: `PostgreSQL`, `Kafka`, `Spark`, `Teradata`, `Databricks`
 - Tools, frameworks and languages with proper names: `Airflow`, `dbt`, `Terraform`,
   `Kubernetes`, `Docker`, `Python`, `Java`, `Power BI`, `Tableau`
@@ -219,22 +231,29 @@ Rules:
 
 ## Field: `segments`
 
-A list of strings from a **closed set**: `Enterprise`, `Mid-Market`, `SMB`. **HARD filter.**
+A list of strings from a **closed set**, and the set is NOT what you might assume. Measured on
+this corpus, `lead_company.segments[]` holds trade-show and product categories, not size bands:
+
+`General` · `Automate26` · `Robotics` · `Food Equipment` · `Medical` · `Logistics`
 
 | The user says | `segments` |
 |---|---|
-| "mid-market", "midmarket", "mid market companies" | `["Mid-Market"]` |
-| "enterprise", "enterprise accounts", "large enterprises" | `["Enterprise"]` |
-| "SMB", "small business", "small and medium business" | `["SMB"]` |
-| "mid-market or enterprise" | `["Mid-Market", "Enterprise"]` |
-| "large companies", "big companies", "small companies" | **nothing** — vague, and this is a hard filter |
+| "in the Robotics segment", "robotics category" | `["Robotics"]` |
+| "Food Equipment segment" | `["Food Equipment"]` |
+| "Medical segment", "Logistics segment" | `["Medical"]` / `["Logistics"]` |
+| "mid-market", "enterprise", "SMB", "small business" | **nothing** — see below |
 
-Emit the values with **exactly** the spelling above — `Mid-Market`, not `mid-market` or
-`MidMarket`. They are matched against a stored value, not interpreted.
+**There is no size band in this field, so a size word must NEVER produce a segment.** An earlier
+version of this schema assumed `Enterprise | Mid-Market | SMB`; **none of those three values
+exists in the data**, so `["Mid-Market"]` matches zero companies and silently empties the result
+set. "mid-market", "enterprise" and "SMB" are size descriptions — route them nowhere here. If the
+user gave a headcount or revenue number alongside, `min_employees`/`max_employees`/revenue carry
+it; if they gave only the vague band word, it produces nothing at all (a hard filter cannot act on
+a vague word — same rule as `min_employees` below).
 
-Note the tension with `min_employees`/`max_employees` below, which says a vague size word must
-produce nothing. That still holds: "mid-market" is a **named segment on the company record**, a
-fact; "mid-size" is an adjective. Only the words in the table above are segments.
+Emit segment values with **exactly** the spelling above — `Food Equipment`, not `food equipment`.
+They are matched against a stored value, not interpreted. Only ever emit a segment when the user
+names one of the six categories above.
 
 ## Fields: `naics` and `sic`
 
@@ -417,6 +436,20 @@ guessing one deletes companies the user never asked to exclude.
 **"companies using Sapient Cloud Suite"**
 - terms: `[{any_of:[Sapient Cloud Suite], source:USES}]` · intent_mode: `USES`
 - It is not `SAP`, and it is not a typo. Emit what the user said.
+
+**"Find companies running legacy SAP ECC who need an upgrade route."**
+- intent: `SEARCH`
+- terms: `[{any_of:[SAP ECC], source:USES}]` · intent_mode: `USES`
+- "SAP ECC" is a named legacy product — extract it. "legacy" describes it; "who need an upgrade
+  route" is the sales angle, not a filter, and names no product, so nothing else is emitted. This
+  is a real, answerable search — **not** `UNPARSEABLE`. Do not fold `SAP ECC` into `SAP`.
+
+**"Find companies that list both Salesforce and Zoho in their technology footprint."**
+- intent: `SEARCH`
+- terms: `[{any_of:[Salesforce], source:USES}, {any_of:[Zoho], source:USES}]` · intent_mode: `USES`
+- "both ... and" is **two groups**. A company needs Salesforce AND Zoho to cover 2/2; one alone
+  covers 1/2 and still appears, ranked lower. `[{any_of:[Salesforce, Zoho]}]` would be "either",
+  which is wrong.
 
 **"create a 3-step campaign for these companies"**
 - intent: `ACTION`. Every other field empty. It is not a search, and "these companies" is not one

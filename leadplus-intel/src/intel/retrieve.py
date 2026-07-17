@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING, Any, Sequence
 import psycopg
 
 from . import embed, repository
-from .canonicalize import location_key, tech_key
+from .canonicalize import industry_key, location_key, tech_key
 from .models import Chips, IntentMode, TermGroup, TermSource, Value
 
 if TYPE_CHECKING:  # pragma: no cover — import only for the type, never at runtime.
@@ -283,6 +283,81 @@ def _canonical_negated(
     return out, notes
 
 
+def _expand_industries(
+    conn: psycopg.Connection, values: Sequence[str], *, strict: bool
+) -> tuple[list[str], list[str]]:
+    """Asked industry -> the SET of taxonomy values to filter on, via `industry_alias`.
+
+    **This is where rule 2's `industry` exception is retired, so here is the argument.** Rule 2
+    says industry must stay soft "because it is free text (`Industrial Machinery` vs the user's
+    `manufacturing`)". That premise is false on this corpus: `lead_company.industry` is a 95-value
+    closed taxonomy, declared in `lead_query`, never free-typed. Rule 2's headline — *filter on
+    facts* — therefore covers it, and the exception was written for a column that does not exist
+    here. What DID exist was the gap between the user's word and the taxonomy's 47 spellings of
+    it, and that gap is what this table closes. The rule was right about the problem and wrong
+    about the column.
+
+    The soft multiplier's measured cost: "companies in the automotive industry with revenue over
+    $100M" returned Industrial-Machinery and Logistics firms at 0.35x — still on page one. There
+    are 4 automotive companies in the pool and none over $100M. Zero was the answer.
+
+    Two modes, and `strict` is CHANGES-v2 §5's override kept intact:
+
+      * default -> the EXPANDED set. "manufacturing" -> 47 values / 11,036 companies. Filtering on
+        the literal string instead would return 1,067 and silently delete 90% of the right answers
+        — rule 2's warning coming true by a different route, which is why expansion comes first.
+      * strict  -> the EXACT value only. "strictly manufacturing" -> `Manufacturing`, 1,067. The
+        user said an insisting word and gets the literal category. §5's contract is unchanged: the
+        override is the user accepting deletions. It now narrows a filter rather than turning one on.
+
+    An unresolvable industry is passed through verbatim and **reported**, exactly as
+    `_expand_locations` does with "Wakanda" — it matches nothing, so the query returns an honest
+    zero and says why. It is NOT dropped. Dropping it is the tempting move and it is the defect:
+    "companies categorized under 'Tech' and 'Enterprise' with no LinkedIn" would silently become
+    "companies with no LinkedIn" — 5,251 confident answers to a question nobody asked. A filter the
+    user asked for and we cannot honour must fail loudly, never quietly widen.
+    """
+    if not values:
+        return [], []
+    keys = [industry_key(v) for v in values]
+    rows = repository.expand_industries(conn, keys)
+    by_alias: dict[str, list[str]] = defaultdict(list)
+    for row in rows:
+        by_alias[row["alias"]].append(row["canonical"])
+
+    out: set[str] = set()
+    notes: list[str] = []
+    for raw, key in zip(values, keys):
+        covered = by_alias.get(key, [])
+        if not covered:
+            notes.append(
+                f"unknown industry {raw!r}: it is not one of the 95 values in this corpus's "
+                f"industry taxonomy and no alias maps to it, so it was matched literally and will "
+                f"return nothing. It was NOT ignored — silently dropping it would answer a "
+                f"different question. Re-seed with scripts/bootstrap_industries.py if it is real."
+            )
+            log.warning("unresolvable industry: %r", raw)
+            out.add(key)
+        elif strict:
+            # `industry_strict`: the literal category, not its family. Prefer the value whose own
+            # name IS what the user typed; if the word is only ever a family word ("automotive" is
+            # not itself a taxonomy value) there is no literal to narrow to, so the expansion
+            # stands and the note says so rather than returning a silent zero.
+            exact = [c for c in covered if industry_key(c) == key]
+            if exact:
+                out.update(exact)
+            else:
+                out.update(covered)
+                notes.append(
+                    f"industry_strict was asked for {raw!r}, but {raw!r} is not itself a taxonomy "
+                    f"value — it is a family word covering {len(covered)}. Filtered on all "
+                    f"{len(covered)}; there is no narrower literal to insist on."
+                )
+        else:
+            out.update(covered)
+    return sorted(out), notes
+
+
 def _expand_locations(
     conn: psycopg.Connection, values: Sequence[str]
 ) -> tuple[list[str], list[str]]:
@@ -347,6 +422,21 @@ def build_filters(
     notes.extend(pos_notes)
     notes.extend(neg_notes)
 
+    # Task 2 — industry is now a HARD filter, expanded through `industry_alias` (see
+    # `_expand_industries` for why rule 2's soft-multiplier exception is retired here). Positives
+    # expand to the family (or, under `industry_strict`, narrow to the literal value); negatives
+    # always expand — "not manufacturing" must exclude all 47 manufacturing values, not just the
+    # one literally spelled "Manufacturing". Both come back as the verbatim taxonomy strings and
+    # are lowercased to meet `_FACT_FILTERS`, which compares `lower(industry_canonical)`.
+    ind_pos, ind_pos_notes = _expand_industries(
+        conn, positive_values(chips.industries), strict=chips.industry_strict
+    )
+    ind_neg, ind_neg_notes = _expand_industries(
+        conn, negated_values(chips.industries), strict=False
+    )
+    notes.extend(ind_pos_notes)
+    notes.extend(ind_neg_notes)
+
     filters: dict[str, Any] = {
         "since_days": chips.since_days,
         "function": chips.function.value if chips.function else None,
@@ -361,14 +451,13 @@ def build_filters(
         "naics": sorted({s.strip() for s in chips.naics if s.strip()}),
         "sic": sorted({s.strip() for s in chips.sic if s.strip()}),
         "has_linkedin": chips.has_linkedin,
-        # §5: the positives are a filter ONLY on the user's explicit "strictly"/"only".
-        "industry_pos": (
-            sorted({v.lower() for v in positive_values(chips.industries)})
-            if chips.industry_strict
-            else []
-        ),
-        # §5: "negated values -> always hard". "not pharma" is an instruction, not a preference.
-        "industry_neg": sorted({v.lower() for v in negated_values(chips.industries)}),
+        # Task 2 — always a hard filter now, over the EXPANDED taxonomy set (or the exact value
+        # under `industry_strict`). The old code only filtered when the user said "strictly" and
+        # let §8.5's multiplier carry the rest — which is how "automotive, revenue > $100M"
+        # returned Industrial-Machinery firms. `ind_pos`/`ind_neg` are already the resolved
+        # taxonomy strings; lowercased here to meet `_FACT_FILTERS`'s `lower(industry_canonical)`.
+        "industry_pos": sorted({v.lower() for v in ind_pos}),
+        "industry_neg": sorted({v.lower() for v in ind_neg}),
         "neg_uses": neg_uses,
         "neg_hiring": neg_hiring,
     }
