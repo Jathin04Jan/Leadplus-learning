@@ -614,6 +614,13 @@ Function       = DATA_ENGINEERING | ERP | CLOUD_INFRA | SECURITY | APP_DEV | ANA
                  INTEGRATION | NETWORKING | OTHER
 Seniority      = INTERN | JUNIOR | MID | SENIOR | LEAD | ARCHITECT | MANAGER | DIRECTOR | EXEC
 EngagementType = PERMANENT | CONTRACT | CONSULTING | UNKNOWN
+
+# SEARCH-EXPLAINED §9 — the CONTACT vocabulary. SEPARATE from the job enums above, deliberately:
+# a job enum describes a requisition, a contact enum describes a person. Do NOT add FINANCE to the
+# job Function.
+ContactFunction  = FINANCE | IT | OPERATIONS | PROCUREMENT | SALES | HR | LEGAL | EXECUTIVE | OTHER
+ContactSeniority = C_LEVEL | VP | DIRECTOR | MANAGER | IC | OTHER
+ResultMode       = COMPANIES | PEOPLE      # PEOPLE consults contact_signal; COMPANIES does not
 ```
 
 ---
@@ -624,13 +631,17 @@ Target **< 100ms** excluding the LLM parse. Everything after the parse is determ
 
 ```
 "manufacturing companies hiring Snowflake, last quarter"
-   [1] PARSE — LLM, cacheable → chips { terms[], industry, since_days, ... }  ← editable in UI
+   [1] PARSE — LLM, cacheable → chips { terms[], industry, since_days, result_mode, ... }  ← editable in UI
    [2] HARD FILTERS — facts only, in SQL (posted_date, employee_range, revenue)
    [3a] LEXICAL ts_rank top 200   ‖   [3b] SEMANTIC exact cosine top 200   (same survivor set)
         over job_signal, job_intent (§5.8) AND company_signal -> SIX lists
-   [4] project jobs→companies, then RRF Σ 1/(60+rank) over 6 company-level lists
+        (+ contact_signal in PEOPLE mode -> EIGHT lists; SEARCH-EXPLAINED §9)
+   [4] project jobs→companies, then RRF Σ 1/(60+rank) over the company-level lists
    [5] COVERAGE per company (terms matched, by Term.source)
-   [6] AGGREGATE → companies + evidence
+   [6] AGGREGATE → companies + evidence (+ role census in PEOPLE mode)
+   [0] if 0 companies AND not a refusal → ZERO-EXPLAINER (SEARCH-EXPLAINED §10):
+       re-run the filter set minus one filter at a time, name the limiter + its coverage %,
+       suggest the relax with its recount. An honest zero explains itself.
 ```
 
 **[1] Parse.** LLM → `Chips`. Cache on the normalized query string. Returned in the response so the
@@ -649,6 +660,7 @@ class Chips(BaseModel):
     function: Function | None = None
     seniority: Seniority | None = None
     intent_mode: IntentMode = "EITHER"   # selects the weight profile (§8.2)
+    result_mode: ResultMode = "COMPANIES"  # PEOPLE → consult contact_signal, role as evidence (§9)
 ```
 
 **[2] Hard filters.** Facts only — the only stage that *removes* candidates.
@@ -763,6 +775,36 @@ CREATE INDEX ON job_intent USING gin (to_tsvector('english', intent));
 -- There is deliberately NO `intent_canonical` and NO `intent_review_queue` table. They existed,
 -- were measured (§5.8) and were dropped. `tech_canonical`/`tech_review_queue` above are NOT the
 -- precedent for re-adding them: a product has an official name; a description does not.
+
+-- SEARCH-EXPLAINED §9 — the contact ROLE CENSUS. The 4th document type ("who is there").
+-- A role, never a person: NO first_name/last_name/full_name/email/phonee164/linkedin_url/notes
+-- column exists, so `\d contact_signal` is the PII proof. `function`/`seniority` are a SEPARATE
+-- vocabulary from the job enums (ContactFunction/ContactSeniority) — job enums describe reqs,
+-- people enums describe people. Deterministic classification from the title, no LLM; only the
+-- embedding of `census_text` costs anything. Consulted only in PEOPLE result mode.
+CREATE TABLE contact_signal (
+  id               bigserial PRIMARY KEY,
+  company_id       bigint NOT NULL,      -- ALWAYS company_canonical.canonical_id, as job_signal
+  lead_contact_id  bigint NOT NULL,
+  canonical_title  text,                 -- the ROLE (a title), never a name
+  seniority        text,                 -- ContactSeniority: C_LEVEL|VP|DIRECTOR|MANAGER|IC|OTHER
+  function         text,                 -- ContactFunction: FINANCE|IT|OPERATIONS|PROCUREMENT|...
+  department       text,
+  is_big4_alum     boolean DEFAULT false,-- a PAST employer is Deloitte/PwC/EY/KPMG
+  prior_employer   text,                 -- the Big-4 firm they left, when is_big4_alum
+  landed_at        date,                 -- start date of the CURRENT role, for "recently landed"
+  census_text      text NOT NULL,        -- the embedded role sentence — role words only, no PII
+  tsv              tsvector GENERATED ALWAYS AS (to_tsvector('english', census_text)) STORED,
+  embedding        vector(3072),         -- NO index. Rule 7.
+  prompt_version   text NOT NULL,
+  model            text NOT NULL,
+  run_at           timestamptz DEFAULT now()
+);
+CREATE UNIQUE INDEX ON contact_signal (lead_contact_id);  -- §5.7's key: one census row per contact
+CREATE INDEX ON contact_signal (company_id);
+CREATE INDEX ON contact_signal USING gin(tsv);
+CREATE INDEX ON contact_signal (function);
+CREATE INDEX ON contact_signal (is_big4_alum) WHERE is_big4_alum;
 ```
 
 **Never `ALTER` or write to `lead_company*`.**

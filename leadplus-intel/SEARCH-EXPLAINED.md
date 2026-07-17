@@ -51,10 +51,11 @@ problem is docs that drift from code (five instances are logged as X1–X5 in `.
 | **Full company index (22,941)** | 🔄 **in progress** | was 462 (2%); indexing now |
 | **`industry_alias` expansion** | 🔄 **in progress** | §6.2 |
 | **`segments` remap to the real vocabulary** | 🔄 **in progress** | §6.3 |
-| **Contact index (`contact_signal`)** | 📋 **PLANNED — not built** | design in §9 |
-| **Zero-explainer UI** | 📋 **PLANNED — not built** | design in §10 |
+| **Contact index (`contact_signal`)** | ✅ **live** | 53,746 role rows, no PII columns; §9 |
+| **Zero-explainer** | ✅ **live** | limiter analysis + relax suggestion; §10 |
 
-**§9 and §10 describe designs, not shipped code.** They are queued. Do not demo them.
+**§9 and §10 are now built and demoable** — the contact role census (PEOPLE result mode) and the
+zero-explainer panel. See those sections for the design and the acceptance output.
 
 ---
 
@@ -421,9 +422,11 @@ Same vocabulary and enums as the normalizer (rule 4). Fields, each with its own 
 
 ---
 
-## 9. 📋 PLANNED — the contact index (`contact_signal`)
+## 9. ✅ BUILT — the contact index (`contact_signal`)
 
-> **NOT BUILT. Queued.** Documented here because the design is settled and the gates now pass.
+> **BUILT.** 53,746 role rows across 13,539 companies, all 3072-dim, no PII columns. Ingest is
+> `scripts/ingest_contacts.py` (deterministic classification + embeddings, ~$0.11). Consulted only
+> in PEOPLE result mode; a COMPANIES query retrieves byte-identically to before it existed.
 
 Originally **skipped** (`CHANGES-v2 §6`) because two gates measured **zero**. That measurement was
 taken on the **synthetic seed** and was wrong. On the real clone both pass decisively:
@@ -467,9 +470,11 @@ a Big-4 alumnus recently landed"* (41).
 
 ---
 
-## 10. 📋 PLANNED — the zero-explainer
+## 10. ✅ BUILT — the zero-explainer
 
-> **NOT BUILT. Queued.**
+> **BUILT.** `retrieve.explain_zero` re-runs the filter set minus one filter at a time (cheap over
+> 22,876 rows), names the limiter with its coverage %, and suggests the relax with its recount.
+> Rendered as a panel in `templates/_results.html`. Fires on an honest zero, never on a refusal.
 
 Some queries return zero **and zero is the correct answer**:
 
@@ -567,12 +572,12 @@ changes them, not a silent mismatch. Point it at a different source and nothing 
 | Structural | blocked on the full index (in progress) |
 | Tech stack | real data exists — SAP ECC **16**, SAP+AWS/Azure **149**, Salesforce+Zoho **20**, Snowflake+AWS **64** |
 | Intent | works — *"companies hiring for ERP migration"* → **Jillamy Inc.**, `Systems Engineer – WMS/ERP`, *"modernizing its warehouse management"* |
-| Contacts (2) | 📋 §9 |
+| Contacts (2) | **pass** (§9) — *"CFOs or VPs of Finance in retail"* → retail companies each with a finance VP/CFO role as evidence; *"Big-4 alumnus recently landed"* → 8 companies, ex-Deloitte/KPMG/PwC/EY roles with landing dates. No names in either. |
 
 ### Cannot pass, honestly
 
 - **"less than 50 employees"** — the smallest bucket is `RANGE_0_500`. Unanswerable.
-- **NAICS 334111** — 0 in the database.
+- **NAICS 334111** — 0 in the database. Now returns a **zero-explainer** (§10), not a bare empty page.
 - **"hiring last quarter"** — 96% of postings have no `posted_date`.
 - **"information friction" / "silently forming an RFP"** — no defined meaning. The sheet asks *"does
   it return results or fail gracefully?"* — **refusing is the pass.**

@@ -123,8 +123,10 @@ class TermSource(str, Enum):
     This is the axis that makes "companies *using* Snowflake" a different question from
     "companies *hiring for* Snowflake" (§5.1), rather than two phrasings of one query.
 
-    `PEOPLE` is deliberately absent: CHANGES-v2 §6 is skipped (gates A and B measured **zero** on
-    this corpus), so there is no contact side for a term to be routed to.
+    `PEOPLE` is deliberately absent even though the contact census now exists (SEARCH-EXPLAINED §9):
+    a contact query is selected by `Chips.result_mode`, not by routing a *term* to a people
+    haystack. Keeping the two orthogonal means "SAP" is the same term whether the answer is a
+    company or a role census — the mode decides which index is consulted, the term never has to.
     """
 
     USES = "USES"
