@@ -149,11 +149,12 @@ the result without reading a job ad.
   question. A real tenant would see a gated subset — say so in the UI.
 - **Never writes to LeadPlus tables.** `lead_company*` belongs to the Java `search` module. We read
   them and write only our own derived tables.
-- **Not a people search. `lead_contact` stays excluded** — see §3's note. CHANGES-v2 §6 proposed a
-  `contact_signal` index and it was **skipped on measurement, not on principle**: the two gates
-  that would have made it useful are zero on this corpus (§0). Nothing in this app answers a
-  question about a named person, and the `PEOPLE` term source, `ContactFunction`,
-  `ContactSeniority` and `result_mode` are deliberately unbuilt.
+- **Still not a people search — it is a role census.** `lead_contact` is now indexed as
+  `contact_signal` (§3, §9): CHANGES-v2 §6 was skipped on a *synthetic* zero-measurement that was
+  wrong, and both gates pass on the real clone. But the answer is still a **company**, with a role
+  as evidence ("has a VP of Finance"), and **no identifying field is stored or returned** — no
+  name, email, phone or LinkedIn. `ContactFunction`/`ContactSeniority`/`result_mode` are built;
+  they are a vocabulary SEPARATE from the job enums (the job `Function` was not widened).
 
 ---
 
