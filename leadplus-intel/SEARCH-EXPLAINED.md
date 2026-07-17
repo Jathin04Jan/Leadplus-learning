@@ -431,10 +431,18 @@ Same vocabulary and enums as the normalizer (rule 4). Fields, each with its own 
 Originally **skipped** (`CHANGES-v2 §6`) because two gates measured **zero**. That measurement was
 taken on the **synthetic seed** and was wrong. On the real clone both pass decisively:
 
-| Gate | Synthetic (wrong) | **Real** |
+| Gate | Synthetic (wrong) | **Real (raw source tables)** |
 |---|---|---|
-| A — `employment_history` in `apollo_contact_data` | 0 / 518 | **4,659 / 36,145** (41 mention a Big-4 firm) |
+| A — `employment_history` in `apollo_contact_data` | 0 / 518 | **4,659 / 36,145** blobs carry employment history |
 | B — CFO / VP-Finance contacts | 0 / 1,242 | **24 CFOs, 83 VP-Finance, 629 finance titles** of 53,848 |
+
+**As built (the actual index, deterministic classification from the title):** `contact_signal` =
+**53,746 roles** across 13,539 companies — **906 classified FINANCE, 306 finance leaders (C-level
+or VP)**, and **19 Big-4 alumni**. On the Big-4 number: ~41 Apollo blobs *mention* a Big-4 name
+somewhere, but an "alumnus" is someone whose **past (non-current) employer** was Big-4 — that is 19,
+and it is the honest figure. `employment_history` carries `start_date`, so "recently landed" is the
+start of the current role; the clone's most-recent starts are ~2022–2024, so "recently" is relative
+to the snapshot.
 
 ### The design: a **role census**, not a contact database
 
@@ -446,8 +454,9 @@ taken on the **synthetic seed** and was wrong. On the real clone both pass decis
 | prior employer + start date (Gate A) | |
 
 You do **not** need identifying fields to answer either question at company level. The result is a
-census of *roles*, not people — you cannot email anyone from it. Reuse `lead_contact_normalized_title`
-(it already carries `canonical_title`/`seniority`/`keywords`).
+census of *roles*, not people — you cannot email anyone from it. (The plan was to reuse
+`lead_contact_normalized_title`, but it is **empty** on the real clone — 0 rows — so function and
+seniority are derived deterministically from the title text instead.)
 
 **Honest caveat:** "the CFO of Acme Corp" still identifies one person. This is **pseudonymous**, not
 anonymous. It satisfies data-minimisation; it does not eliminate the question.
@@ -465,8 +474,10 @@ contact_signal  -> "who is there"     (people signal)      <- new
         +---- all three -> project to company -> RRF -> rank ----+
 ```
 
-Unlocks two test prompts with **real** people: *"CFOs or VPs of Finance"* (107) and *"companies where
-a Big-4 alumnus recently landed"* (41).
+Unlocks two test prompts with **real** people, answered at the company level with the role as
+evidence and no names: *"CFOs or VPs of Finance"* (306 finance leaders across the index) and
+*"companies where a Big-4 alumnus recently landed"* (19 alumni, shown with the firm they left and
+their landing date).
 
 ---
 

@@ -39,6 +39,13 @@ Probes run against the live v1 app:
 **→ §6 (`contact_signal`) is SKIPPED.** Gates A and B are zero: it can be neither built usefully nor
 tested here. Revisit only when the real corpus is readable.
 
+> **⚠️ SUPERSEDED — `contact_signal` was later BUILT.** Gates A and B above were measured on the
+> **synthetic seed** and were wrong. On the real clone both pass (A: 4,659/36,145 carry
+> `employment_history`; B: 20 CFOs / 906 finance roles), so the role census shipped: **53,746
+> roles, no PII columns**, a 4th retrieval source in `PEOPLE` mode. See SEARCH-EXPLAINED §9 and
+> ARCHITECTURE §3 for the built design. The rest of §6 below is kept as the historical decision
+> record; it no longer reflects the shipped system.
+
 ---
 
 ## 1. Intent triage + the empty-chips guard — **DO THIS FIRST**
@@ -72,7 +79,8 @@ nobody can edit. **Do not build one.**
 class TermGroup(BaseModel):
     model_config = ConfigDict(extra="forbid")
     any_of: list[str]                       # OR within the group
-    source: TermSource = TermSource.ANY     # USES | HIRING | ANY   (PEOPLE dropped — §6 skipped)
+    source: TermSource = TermSource.ANY     # USES | HIRING | ANY   (no PEOPLE source — contacts
+                                            # are selected by result_mode, not by routing a term; §9)
     negate: bool = False
 
 class Value(BaseModel):                     # reused by industries + locations
@@ -205,18 +213,24 @@ industry_strict: bool = False     # "strictly" | "only" | "must be" -> hard filt
 - `industry_strict` → hard filter on `industry_canonical`, multiplier skipped
 - negated values → always hard
 
-## 6. ~~`contact_signal`~~ — **SKIPPED**
+## 6. ~~`contact_signal` — SKIPPED~~ → **BUILT** (the skip was superseded)
 
-Gates A and B are **zero** on this corpus (§0). "Big-4 alumnus recently landed" is dead on data;
-`PEOPLE` mode has nothing to return. `TermSource.PEOPLE`, `ContactFunction`, `ContactSeniority`,
-`result_mode` and `INTEL_INGEST_CONTACT_PII` are **not built**.
+> **This section's SKIP decision was reversed.** Gates A and B measured zero on the *synthetic
+> seed*; on the real clone they pass, and `contact_signal` shipped — 53,746 roles, no PII columns,
+> a role census consulted in `PEOPLE` result mode. `ContactFunction`, `ContactSeniority` and
+> `result_mode` **are built** (as a vocabulary separate from the job enums). The canonical design
+> and acceptance output now live in **SEARCH-EXPLAINED §9** and **ARCHITECTURE §3** — read those,
+> not the historical text below.
 
-If the real corpus ever lands, the original design holds and is worth revisiting: ingest a **role
-census** (`title`, `department`, `seniority`, `normalized_title_tokens`) and **never** names, emails,
-phones or LinkedIn — you don't need identifying fields to answer at company level. Note honestly that
-"the CFO of Acme" is still *pseudonymous*, not anonymous. Reuse `lead_contact_normalized_title`
-(it already has `canonical_title`/`seniority`/`keywords`). Do **not** widen the job `Function` enum
-with `FINANCE` — job enums describe reqs, not people.
+Gates A and B were **zero** on the *synthetic* corpus (§0), which is why this was skipped at the
+time. "Big-4 alumnus recently landed" looked dead on data; `PEOPLE` mode had nothing to return.
+
+The original design (now the built one) holds: ingest a **role census** (`title`, `department`,
+`seniority`, `normalized_title_tokens`) and **never** names, emails, phones or LinkedIn — you don't
+need identifying fields to answer at company level. "The CFO of Acme" is still *pseudonymous*, not
+anonymous. (`lead_contact_normalized_title` turned out **empty** on the real clone, so function and
+seniority are derived from the title text instead.) The job `Function` enum was **not** widened
+with `FINANCE` — job enums describe reqs, not people; contacts got their own vocabulary.
 
 ## 7. Parser rules — a rule per field, or none of the above works
 
@@ -257,9 +271,12 @@ Electronics, Pharma…), so the `'Tech' AND 'Enterprise'` prompt is rewritten to
 | 5 | `industries` + `industry_strict` (§5) | ~20 | no |
 | 6 | Parser rules (§7) | ~50 | no — **required by 2–5** |
 | 7 | Scoring: group coverage, industry max (§10) | ~20 | no |
-| ~~8~~ | ~~`contact_signal`~~ | — | **skipped, §0** |
+| 8 | `contact_signal` role census (SEARCH-EXPLAINED §9) | new module | **yes — one embedding pass, ~$0.11** (skip was later reversed) |
+| 9 | Zero-explainer (SEARCH-EXPLAINED §10) | ~120 | no |
 
-**~half a day, no re-ingest, $0 LLM.** Everything rides joins that already exist.
+**Items 1–7: ~half a day, no re-ingest, $0 LLM** — they ride joins that already exist. Items 8–9
+(the contact census and zero-explainer) shipped afterwards; the census needs a one-time embedding
+pass (~$0.11, no LLM), the zero-explainer needs neither.
 
 ## 10. Scoring changes (`score.py`)
 

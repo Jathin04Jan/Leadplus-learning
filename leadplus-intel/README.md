@@ -10,7 +10,21 @@ It exists to fix three measured defects in that system:
 |---|---|
 | **"and" means OR** (`keywordMatchMode` defaults to ANY) | terms **never filter** — they feed `coverage`. 3-of-3 outranks 1-of-3; nothing is dropped. |
 | **`LIKE '%sap%'` matches *Sapient*** | canonical-term equality + word-boundary FTS. Re-measured on the **real** corpus: `LIKE '%sap%'` returns **255**, only **132** carry SAP as a canonical technology — **123 false positives (93% inflation)**. Real victims: **Che·sap·eake Systems**, and `SAP America, Inc.` itself (a company *named* SAP is not a company *using* SAP). |
-| **No ranking** (sorts by `updated_at DESC`) | 6-retriever RRF + explainable per-axis score (§8). |
+| **No ranking** (sorts by `updated_at DESC`) | 6-retriever RRF + explainable per-axis score (§8); 8 retrievers in people mode. |
+
+### Beyond the three defects — what this build also ships
+
+- **Full company index (22,876).** Every canonical company is searchable, not just the 487 with
+  text job postings — the rest are indexed by a deterministic template (one embedding each, ~$0.13
+  total), so structural queries return results instead of 0. See SEARCH-EXPLAINED §5.
+- **Contact role census (`contact_signal`, SEARCH-EXPLAINED §9).** 53,746 roles across 13,539
+  companies, as a 4th retrieval source. It is a *role census, not a contact database*: it stores
+  **no** name, email, phone or LinkedIn — only the role, function, seniority and a Big-4-alumnus
+  flag. In `PEOPLE` result mode it answers "companies with a CFO / VP of Finance / a Big-4 alumnus"
+  at the company level, with the role as evidence and no individual exposed.
+- **Zero-explainer (SEARCH-EXPLAINED §10).** When a search legitimately returns zero, it names the
+  limiting filter with its measured coverage %, and suggests which filter to drop (with the recount)
+  — instead of a blank page that reads as a bug.
 
 ## ⚠️ Read this before quoting any number
 
@@ -29,17 +43,21 @@ complete; RDS is done with.
 ### What the real data says that the spec did not
 
 - **Only 2,886 of 13,082 active jobs carry a description >200 chars.** The other ~78% are stubs
-  with no prose. Only those 2,886 (across 487 canonical companies) are extracted — normalizing a
-  stub invents signal rather than finding it.
+  with no prose. Only those 2,886 (across 487 canonical companies) get an LLM-read **hiring**
+  signal — normalizing a stub invents signal rather than finding it. Every canonical company
+  (**22,876**) is still in the index via a deterministic company template (no LLM), so structural
+  queries ("manufacturers in California") work; only the *hiring* half is limited to the 487.
 - **The corpus is 49% healthcare, 15% retail, 13% financial services — and 7% manufacturing.**
   Every "industrial manufacturer migrating SAP ECC" example in the spec describes 7% of the data.
   `prompts/job_normalizer.md` v6 was corrected for this; read §0 before writing a prompt.
-- **Every `posted_date` in the indexed corpus is FAKE.** 125 of the 2,886 extractable postings
-  carry a date; **all 125 belong to 25 seeded demo companies** (`tenant_id 29`, `Synthetic *`,
-  `.example` domains). Real dated postings exist (22 active) but none carry description text, so
-  none are extractable. So `recency` is 0.0 for **every real company**, `since_days` can only
-  ever return fictions, and the §0 thesis ("posted six days ago -> actively investing") is
-  **unprovable on this data**. This is not a scraper gap to wave at — it is the finding.
+- **No `posted_date` in the indexed corpus.** The only rows that carried a date were the 25 seeded
+  demo companies (`tenant_id 29`, `Synthetic *`, `.example` domains), and those are now **excluded
+  from the index** at the company fold — so **0 of the 2,761 indexed postings carry a date.** Real
+  dated postings exist (22 active) but none carry description text, so none are extractable. So
+  `recency` is 0.0 for **every company**, a `since_days` filter returns **nothing** (the
+  zero-explainer says why, rather than returning fictions as it once did), and the §0 thesis
+  ("posted six days ago -> actively investing") is **unprovable on this data**. This is not a
+  scraper gap to wave at — it is the finding.
 - **The corpus is multilingual** (German is common).
 - **`evals/golden.yaml` is dead** — its labels are synthetic company ids that now point at
   unrelated real companies. `scripts/eval.py` refuses to score it rather than emit a confident
@@ -52,7 +70,7 @@ complete; RDS is done with.
 queue) to intent phrases too. It was a **category error**:
 
 - A **technology is a named product**: `SAP S/4HANA` / `S/4 HANA` / `SAP S4` really are one thing
-  with an official form, so canonicalising **recovers** a real identity. `tech_canonical` (4,529
+  with an official form, so canonicalising **recovers** a real identity. `tech_canonical` (4,509
   terms) stays, and its ladder catches real traps (`ROS`→`ROSS` @ 0.79).
 - An **intent is a descriptive phrase**: `icd-10 coding accuracy`, `drg assignment validation`.
   There is no official form to snap to, so canonicalising **invents** an identity.
@@ -85,12 +103,14 @@ uv venv && uv pip install -r <(uv pip compile pyproject.toml)
 
 .venv/bin/python scripts/init_db.py            # our derived tables (§7)
 .venv/bin/python scripts/profile_data.py       # §15 gates
-.venv/bin/python scripts/bootstrap_canonical.py   # §5.4 fold: 22,966 -> 22,901
-.venv/bin/python scripts/bootstrap_tech.py --skip-industry   # seed tech_canonical (4,529 terms)
+.venv/bin/python scripts/bootstrap_canonical.py   # §5.4 fold: 22,966 -> 22,876
+.venv/bin/python scripts/bootstrap_tech.py --skip-industry   # seed tech_canonical (4,509 terms)
 .venv/bin/python scripts/bootstrap_locations.py   # location_alias (CHANGES-v2 §3.1) — no LLM, $0
 .venv/bin/python scripts/ingest.py --limit 25 --dry-run   # ALWAYS sample & READ the paraphrases
-.venv/bin/python scripts/ingest.py             # full: 2,886 jobs + 487 companies (~$3.79, ~2.5h)
+.venv/bin/python scripts/ingest.py             # LLM hiring signal: 2,886 jobs + 487 companies (~$3.79, ~2.5h)
 .venv/bin/python scripts/bootstrap_tech.py     # canonicalise stored tech + §5.5 industries
+.venv/bin/python scripts/backfill_company_signal.py   # template-index all 22,876 companies (no LLM, ~$0.13)
+.venv/bin/python scripts/ingest_contacts.py    # contact role census: 53,746 roles, no PII (no LLM, ~$0.11)
 .venv/bin/uvicorn intel.main:app --app-dir src --port 8000
 .venv/bin/python scripts/acceptance.py         # behavioural guarantees (refusal, determinism, negation)
 ```
@@ -111,7 +131,10 @@ Responses carry the parsed `chips` (**editable in the UI** — a wrong parse mus
 the per-axis `breakdown` + applied `intent_mode`/`industry_multiplier`, and `evidence[]`. When the
 query excludes something, `excluded[]` lists what was removed and `breakdown.excluded_by` names the
 group that did it. When the query is not a search, `refusal` says so and `companies` is empty —
-**that is the answer, not a failure** (CHANGES-v2 §1).
+**that is the answer, not a failure** (CHANGES-v2 §1). A `PEOPLE`-mode query
+(`result_mode: PEOPLE`) also carries `contact_evidence[]` per company — the matching role census,
+never a name (SEARCH-EXPLAINED §9). An honest zero carries `zero_explainer` — the limiting filter,
+its coverage %, and a relax suggestion (§10).
 
 ## Verified
 

@@ -459,12 +459,12 @@ WHERE active`. If equal, copy-on-write isn't populated in this restore and the f
 **MEASURED ON THE REAL CORPUS — the fold works, but not for the reason this section gives.**
 
 ```
-active lead_company rows : 22,966
-canonical companies      : 22,901      -> 65 rows collapsed, across 60 domain groups
+active lead_company rows (real, excl. .example) : 22,941
+canonical companies                             : 22,876   -> 65 rows collapsed, across 60 domain groups
 ```
 
 So it is **no longer a no-op** (it was, on synthetic). But the premise above is still mostly
-wrong: **copy-on-write is barely populated** — only 28 of 22,966 active rows carry a
+wrong: **copy-on-write is barely populated** — only 28 of 22,941 active rows carry a
 `tenant_id`, and of the 60 multi-member groups, **58 are duplicate SHARED rows** (two
 `tenant_id IS NULL` rows, same domain) and only **2** are the shared+tenant pattern §5.4
 describes. The fold is catching plain duplicate companies, not copy-on-write.
