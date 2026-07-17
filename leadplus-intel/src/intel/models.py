@@ -196,6 +196,14 @@ class CompanySource(BaseModel):
     region: str | None = None
     employee_count: str | None = None
     employee_range: str | None = None
+    # `employee_count` is a varchar and it is NOT a number: 16,829 of 22,941 rows hold a bucket
+    # string ('201-500 employees'), 186 hold '10K'/'1.5K'/'10,001+'. These two are that column
+    # parsed into an interval BY THE DATABASE, using the same `_EMP_LOW`/`_EMP_HIGH` expressions
+    # the employee filter selects on — so the size word a paraphrase claims and the size a filter
+    # matches can never disagree. `high` is None for an open-ended bucket ('10,001+ employees').
+    # Only `fetch_companies_for_template` populates them; the LLM path never needed them.
+    emp_low: int | None = None
+    emp_high: int | None = None
     revenue_usd: float | None = None
     keywords: list[str] = Field(default_factory=list)
     technologies: list[str] = Field(default_factory=list)

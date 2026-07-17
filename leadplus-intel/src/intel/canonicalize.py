@@ -143,6 +143,22 @@ def location_key(value: str) -> str:
     return re.sub(r"\s+", " ", (value or "").strip().lower())
 
 
+def industry_key(value: str) -> str:
+    """The `industry_alias.alias` key: lowercased, whitespace-collapsed, punctuation kept.
+
+    Deliberately `location_key`'s rule and NOT `tech_key`'s. Stripping punctuation is right for
+    products (`S/4HANA` and `S4HANA` are one thing) and wrong here: the taxonomy contains
+    `Transportation, Logistics, Supply Chain and Storage` and `Glass, Ceramics and Concrete
+    Manufacturing`, whose commas carry the sense, and `tech_key` would also collapse the space in
+    `supply chain` — turning two words a user types into one token nothing matches.
+
+    Note `retrieve.canonical_industries` still resolves the *chip* against the §5.5 vocabulary with
+    `tech_key`, and that is a different job: matching one spelling of one value. This key is for
+    the alias table, where a phrase has to survive a round trip to `lead_company.industry`.
+    """
+    return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+
 @dataclass
 class TechResolution:
     raw_term: str

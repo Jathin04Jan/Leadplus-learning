@@ -162,6 +162,42 @@ CREATE TABLE IF NOT EXISTS location_alias (
 );
 CREATE INDEX IF NOT EXISTS location_alias_canonical_idx ON location_alias (canonical);
 
+-- ---------------------------------------------------------------------------
+-- industry_alias — the same idea as `location_alias`, and it exists because rule 2's premise
+-- about `industry` was FALSE on this corpus.
+--
+-- Rule 2 says: "`industry` is NOT a filter — it's free-text (`Industrial Machinery` vs the user's
+-- `manufacturing`). Hard-filtering it silently deletes correct answers." That reasoning is sound
+-- and its premise was never checked. Measured on the real corpus, `lead_company.industry` is a
+-- **95-value closed taxonomy** (LinkedIn-style: `Manufacturing`, `Machinery Manufacturing`,
+-- `Motor Vehicle Manufacturing`, `Hospitals and Health Care`, …), declared in `lead_query` and
+-- never free-typed. It is a FACT, and rule 2's own sentence — "filter on facts" — therefore
+-- applies to it. The exception was written for a column that does not exist here.
+--
+-- What the soft multiplier actually did, measured: "companies in the automotive industry with
+-- revenue over $100M" returned Industrial-Machinery and Logistics companies. There are **4**
+-- automotive companies in the entire pool and **none** over $100M, so the honest answer was 0 and
+-- the tool answered with a page of wrong ones instead.
+--
+-- BUT A NAIVE HARD FILTER IS WORSE, WHICH IS WHY THIS TABLE IS NOT A COLUMN COMPARISON. A user
+-- who says "manufacturing" means ~11,032 companies across 25 taxonomy values;
+-- `industry = 'Manufacturing'` matches **1,067**. Hard-filtering on the literal string deletes 90%
+-- of the correct answers — rule 2's warning coming true, just not for rule 2's reason.
+--
+-- So: alias -> the SET of taxonomy values it covers, and the chip is EXPANDED before it filters.
+-- `(alias, canonical)` is the primary key, NOT `alias` alone — that is the whole difference from
+-- `location_alias`, where one alias means one place. One industry word means MANY values, and a
+-- unique `alias` could not say so.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS industry_alias (
+  alias      text NOT NULL,      -- 'manufacturing', 'automotive', 'healthcare'  (lowercased)
+  canonical  text NOT NULL,      -- a value of lead_company.industry, VERBATIM (not lowercased):
+                                 -- it is compared to company_signal.industry_canonical
+  kind       text NOT NULL,      -- 'family' (a user word covering many) | 'exact' (self-mapping)
+  PRIMARY KEY (alias, canonical)
+);
+CREATE INDEX IF NOT EXISTS industry_alias_canonical_idx ON industry_alias (canonical);
+
 -- §5.2 stage 3 — terms we could not resolve. A human resolves these; we NEVER auto-guess.
 CREATE TABLE IF NOT EXISTS tech_review_queue (
   raw_term    text PRIMARY KEY,

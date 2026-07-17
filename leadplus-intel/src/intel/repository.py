@@ -403,7 +403,7 @@ def fetch_companies_to_normalize(
     When that spend is approved, delete the EXISTS clause — nothing else changes.
     """
     rows = conn.execute(
-        """
+        f"""
         SELECT cc.canonical_id,
                cc.member_ids,
                cc.domain,
@@ -423,21 +423,7 @@ def fetch_companies_to_normalize(
                u.scraped_services
         FROM company_canonical cc
         JOIN lead_company c ON c.id = cc.canonical_id
-        CROSS JOIN LATERAL (
-          -- Union each array column across all member rows independently. Unnesting them in
-          -- one pass would cartesian-product the columns against each other.
-          SELECT
-            COALESCE((SELECT array_agg(DISTINCT x) FROM lead_company m,
-                        unnest(m.keywords) AS x WHERE m.id = ANY(cc.member_ids)), '{}')             AS keywords,
-            COALESCE((SELECT array_agg(DISTINCT x) FROM lead_company m,
-                        unnest(m.technologies) AS x WHERE m.id = ANY(cc.member_ids)), '{}')         AS technologies,
-            COALESCE((SELECT array_agg(DISTINCT x) FROM lead_company m,
-                        unnest(m.scraped_technologies) AS x WHERE m.id = ANY(cc.member_ids)), '{}') AS scraped_technologies,
-            COALESCE((SELECT array_agg(DISTINCT x) FROM lead_company m,
-                        unnest(m.scraped_tools) AS x WHERE m.id = ANY(cc.member_ids)), '{}')        AS scraped_tools,
-            COALESCE((SELECT array_agg(DISTINCT x) FROM lead_company m,
-                        unnest(m.scraped_services) AS x WHERE m.id = ANY(cc.member_ids)), '{}')     AS scraped_services
-        ) u
+        CROSS JOIN LATERAL ({_MEMBER_ARRAY_UNION}) u
         WHERE cc.canonical_id > %(cursor)s
           AND EXISTS (
             -- Only companies with job evidence. See the docstring: the other 22,478 are a
@@ -463,6 +449,114 @@ def fetch_companies_to_normalize(
             "limit": limit,
             "min_chars": config.MIN_DESCRIPTION_CHARS,
         },
+    ).fetchall()
+    out: list[CompanySource] = []
+    for r in rows:
+        r = dict(r)
+        if r.get("revenue_usd") is not None:
+            r["revenue_usd"] = float(r["revenue_usd"])
+        out.append(CompanySource(**r))
+    return out
+
+
+# The array-union subquery, shared verbatim by the LLM extract above and the template extract
+# below. §5.4: a per-tenant copy may carry enrichment the shared row lacks, so every array column
+# is unioned across `member_ids` — each in its own scalar subquery, because unnesting them in one
+# pass would cartesian-product the columns against each other.
+_MEMBER_ARRAY_UNION = """
+          SELECT
+            COALESCE((SELECT array_agg(DISTINCT x) FROM lead_company m,
+                        unnest(m.keywords) AS x WHERE m.id = ANY(cc.member_ids)), '{}')             AS keywords,
+            COALESCE((SELECT array_agg(DISTINCT x) FROM lead_company m,
+                        unnest(m.technologies) AS x WHERE m.id = ANY(cc.member_ids)), '{}')         AS technologies,
+            COALESCE((SELECT array_agg(DISTINCT x) FROM lead_company m,
+                        unnest(m.scraped_technologies) AS x WHERE m.id = ANY(cc.member_ids)), '{}') AS scraped_technologies,
+            COALESCE((SELECT array_agg(DISTINCT x) FROM lead_company m,
+                        unnest(m.scraped_tools) AS x WHERE m.id = ANY(cc.member_ids)), '{}')        AS scraped_tools,
+            COALESCE((SELECT array_agg(DISTINCT x) FROM lead_company m,
+                        unnest(m.scraped_services) AS x WHERE m.id = ANY(cc.member_ids)), '{}')     AS scraped_services
+"""
+
+# The template backfill's scope predicate: a canonical company with NO `company_signal` row of any
+# kind. Deliberately NOT keyed on (prompt_version, model) like `fetch_companies_to_normalize`.
+#
+# That difference IS the "keep the 462" rule, expressed where it cannot be forgotten. 462 companies
+# already carry an LLM-written paraphrase and a real intent extraction; a template built from
+# `industry` + `hq_city` + `technologies[]` is strictly poorer than that. Keying this on the
+# template's own prompt_version would make every one of them "missing the template version" and the
+# backfill would overwrite richer data with thinner data, on its first run, silently. Keying it on
+# "has no row at all" makes that impossible rather than merely discouraged.
+_NO_COMPANY_SIGNAL = """
+          AND NOT EXISTS (SELECT 1 FROM company_signal s WHERE s.company_id = cc.canonical_id)
+"""
+
+
+def count_companies_for_template(conn: psycopg.Connection) -> dict[str, Any]:
+    """The backfill's denominator: canonical companies, and how many still lack a signal row."""
+    return conn.execute(
+        """
+        SELECT count(*) AS canonical,
+               count(*) FILTER (
+                 WHERE NOT EXISTS (SELECT 1 FROM company_signal s
+                                   WHERE s.company_id = cc.canonical_id)
+               ) AS without_signal
+        FROM company_canonical cc
+        """
+    ).fetchone()  # type: ignore[return-value]
+
+
+def fetch_companies_for_template(
+    conn: psycopg.Connection, *, cursor: int, limit: int = config.FETCH_BATCH_SIZE
+) -> list[CompanySource]:
+    """Every canonical company that has NO `company_signal` row, for the deterministic backfill.
+
+    The scope difference from `fetch_companies_to_normalize` is the whole point, and it is two
+    predicates:
+
+      * that function's `EXISTS (... lead_company_job ...)` clause is **gone**. It limited the
+        index to the 488 companies with a text-bearing job, on the grounds that the other ~22.5k
+        were ~$25 of LLM calls nobody had approved. They are not $25 any more: a deterministic
+        template costs one embedding each (~$0.13 for the lot), so the reason for the restriction
+        has evaporated and with it the restriction. A lead-search tool with 2% of its leads
+        indexed cannot answer "which companies use X" for 98% of the pool — structural queries
+        returned 0 because the companies were not there, not because search was broken.
+      * `_NO_COMPANY_SIGNAL` replaces the (prompt_version, model) key. See its comment: it is what
+        stops the template overwriting the 462 richer LLM paraphrases.
+
+    `emp_low`/`emp_high` come back parsed by `_EMP_LOW`/`_EMP_HIGH` — the SAME expressions the
+    employee filter uses — so the size word a paraphrase claims and the size a filter selects on
+    can never disagree. Deriving one of them in Python would let them.
+    """
+    rows = conn.execute(
+        f"""
+        SELECT cc.canonical_id,
+               cc.member_ids,
+               cc.domain,
+               c.name,
+               c.industry,
+               c.hq_city,
+               c.hq_state,
+               c.hq_country,
+               c.region,
+               c.employee_count,
+               c.employee_range,
+               c.revenue_usd,
+               {_EMP_LOW}  AS emp_low,
+               {_EMP_HIGH} AS emp_high,
+               u.keywords,
+               u.technologies,
+               u.scraped_technologies,
+               u.scraped_tools,
+               u.scraped_services
+        FROM company_canonical cc
+        JOIN lead_company c ON c.id = cc.canonical_id
+        CROSS JOIN LATERAL ({_MEMBER_ARRAY_UNION}) u
+        WHERE cc.canonical_id > %(cursor)s
+          {_NO_COMPANY_SIGNAL}
+        ORDER BY cc.canonical_id
+        LIMIT %(limit)s
+        """,
+        {"cursor": cursor, "limit": limit},
     ).fetchall()
     out: list[CompanySource] = []
     for r in rows:
@@ -1101,6 +1195,83 @@ def expand_locations(conn: psycopg.Connection, aliases: Sequence[str]) -> list[d
 
 
 # ---------------------------------------------------------------------------
+# The industry vocabulary — `industry_alias`, the location_alias pattern applied to a taxonomy.
+# ---------------------------------------------------------------------------
+
+
+def replace_industry_aliases(
+    conn: psycopg.Connection, rows: Sequence[tuple[str, str, str]]
+) -> int:
+    """Rebuild `industry_alias` wholesale from the seed. A pure function of the seed + the corpus."""
+    if not rows:
+        return 0
+    with conn.transaction():
+        conn.execute("TRUNCATE industry_alias")
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO industry_alias (alias, canonical, kind) VALUES (%s, %s, %s) "
+                "ON CONFLICT (alias, canonical) DO UPDATE SET kind = EXCLUDED.kind",
+                list(rows),
+            )
+    return len(rows)
+
+
+def count_industry_aliases(conn: psycopg.Connection) -> dict[str, Any]:
+    return conn.execute(
+        """
+        SELECT count(*) AS rows, count(DISTINCT alias) AS aliases,
+               count(DISTINCT canonical) AS canonicals,
+               count(*) FILTER (WHERE kind = 'family') AS family,
+               count(*) FILTER (WHERE kind = 'exact')  AS exact
+        FROM industry_alias
+        """
+    ).fetchone()  # type: ignore[return-value]
+
+
+def expand_industries(conn: psycopg.Connection, aliases: Sequence[str]) -> list[dict[str, Any]]:
+    """alias key -> the SET of taxonomy values it covers. The expansion, done in the repository.
+
+    The direct counterpart of `expand_locations`, and it lives here for the same reason §3 gives:
+    the parser cannot know what spellings this restore holds, and if it guesses it produces a
+    filter that matches zero rows and a user who is told, wrongly, that there are no manufacturers.
+
+    The difference from `expand_locations` is the cardinality, and it is the whole point.
+    One location alias means one place; one industry alias means **many** taxonomy values —
+    `manufacturing` covers 25 of them. So this returns rows, not a mapping, and the caller
+    unions them.
+    """
+    if not aliases:
+        return []
+    return conn.execute(
+        """
+        SELECT alias, canonical, kind FROM industry_alias
+        WHERE alias = ANY(%(aliases)s::text[])
+        ORDER BY alias, canonical
+        """,
+        {"aliases": list(aliases)},
+    ).fetchall()
+
+
+def known_segments(conn: psycopg.Connection) -> list[dict[str, Any]]:
+    """The values `lead_company.segments[]` actually holds. READ-ONLY.
+
+    There is no `segment_alias` table and there should not be: `segments` is already a short closed
+    set of exact strings with no synonyms anyone types (nobody has ever typed "Automate26" by
+    accident). What it needs is not canonicalisation but **reality** — CHANGES-v2 §4 asserted the
+    set was `Enterprise | Mid-Market | SMB`, and not one of those three exists. Reading the column
+    is how a filter stops being built on a guess. See CHANGES-v2 §4 for the numbers.
+    """
+    return conn.execute(
+        """
+        SELECT s AS value, count(*) AS n
+        FROM lead_company, unnest(segments) AS s
+        WHERE active AND domain NOT LIKE '%%.example'
+        GROUP BY 1 ORDER BY 2 DESC, 1
+        """
+    ).fetchall()
+
+
+# ---------------------------------------------------------------------------
 # §5.5 — industry canonicalisation
 # ---------------------------------------------------------------------------
 
@@ -1116,6 +1287,31 @@ def fetch_industry_vocabulary(conn: psycopg.Connection) -> list[str]:
         """
     ).fetchall()
     return [r["value"] for r in rows]
+
+
+def distinct_company_industries(conn: psycopg.Connection) -> list[dict[str, Any]]:
+    """The industry values this restore actually holds, with their weights. READ-ONLY.
+
+    `lead_query WHERE type='COMPANY_INDUSTRY'` (§5.5) is the *declared* taxonomy — 91 values — and
+    `lead_company.industry` is what the rows *say*: 95 values, overlapping but not equal (the
+    column carries `Software`, `Cloud`, `Analytics`, `Logistics`, `Technology`, `Finance Tech`,
+    which the declared list does not). `bootstrap_industries.py` needs both, for the same reason
+    `bootstrap_locations.py` sweeps `hq_city`: a vocabulary that misses a value the corpus holds
+    fails **silently** — the query just returns nothing, and an empty page reads as an answer.
+
+    The counts come back because they are the argument. "manufacturing" covering 11,032 companies
+    across 25 taxonomy values, versus `industry = 'Manufacturing'` covering 1,067, is not a fact
+    anyone should have to take on trust from a comment.
+    """
+    return conn.execute(
+        """
+        SELECT trim(industry) AS value, count(*) AS n
+        FROM lead_company
+        WHERE active AND industry IS NOT NULL AND trim(industry) <> ''
+        GROUP BY 1
+        ORDER BY 2 DESC, 1
+        """
+    ).fetchall()
 
 
 def fetch_company_industries(conn: psycopg.Connection) -> list[dict[str, Any]]:
@@ -1272,16 +1468,67 @@ _JOB_FILTERS = """
 """
 
 # Firmographic facts live on `lead_company`, not on our derived tables, so both the job and the
-# company lists join to it to filter. `employee_count` is a varchar holding a number, hence the
-# digit-strip before the cast; a non-numeric value becomes NULL and fails the comparison rather
-# than raising.
-_FIRMO_FILTERS = """
-          AND (%(min_employees)s::bigint IS NULL
-               OR NULLIF(regexp_replace(c.employee_count, '[^0-9]', '', 'g'), '')::bigint
-                  >= %(min_employees)s::bigint)
-          AND (%(max_employees)s::bigint IS NULL
-               OR NULLIF(regexp_replace(c.employee_count, '[^0-9]', '', 'g'), '')::bigint
-                  <= %(max_employees)s::bigint)
+# company lists join to it to filter.
+#
+# ---- `employee_count` IS NOT A NUMBER, AND READING IT AS ONE DELETED 269 OF 273 ANSWERS -------
+#
+# This filter used to be `regexp_replace(c.employee_count, '[^0-9]', '', 'g')::bigint`, i.e.
+# "strip everything that isn't a digit and call the rest the headcount". That is only correct for
+# the 5,672 rows that hold a bare integer. Measured across the 22,941 active real companies:
+#
+#     bare integer   ('1600')                     :  5,672
+#     bucket string  ('201-500 employees')        : 16,829   <- the MAJORITY
+#     other          ('10K', '1.5K', '10,001+')   :    186
+#     NULL                                        :    254
+#
+# On a bucket string the digit-strip concatenates the bounds:
+#
+#     '201-500 employees'    -> 201500     (two hundred thousand employees)
+#     '501-1,000 employees'  -> 5011000    (five million)
+#     '10K'                  -> 10         (ten, not ten thousand)
+#     '1.5K'                 -> 15         (fifteen, not fifteen hundred)
+#
+# So "manufacturing companies in California with 500-1000 employees" returned **4** — the four
+# whose bare integer happened to land in range — while the **269** Californian manufacturers whose
+# row literally reads `501-1,000 employees` were deleted before ranking ever saw them. That is
+# this project's founding disease (a silent false negative nobody can see) reproduced inside the
+# replacement, in the one filter that looked too boring to check.
+#
+# The fix parses the column into a [low, high] interval instead, and the parse lives HERE, in one
+# SQL fragment, because `fetch_companies_for_template` needs the same numbers to write a size word
+# into a paraphrase. Two parsers would eventually disagree about what a row means — the lesson
+# `config.assert_local_database` and `repository.tech_alias_collisions` both learned the hard way.
+#
+# `high` is NULL for an open-ended bucket ('10,001+ employees'): there is no upper bound to
+# compare, and inventing one would be a guess.
+_EMP_LOW = """NULLIF(CASE
+          WHEN c.employee_count ~ '^\\s*[0-9]+\\s*$'          THEN trim(c.employee_count)
+          WHEN c.employee_count ~ '^\\s*[0-9,]+\\s*-'         THEN replace(split_part(c.employee_count, '-', 1), ',', '')
+          WHEN c.employee_count ~ '^\\s*[0-9,]+\\s*\\+'        THEN replace(regexp_replace(c.employee_count, '[^0-9,].*$', '', 'g'), ',', '')
+          WHEN c.employee_count ~ '^\\s*[0-9.]+\\s*[Kk]\\s*$'  THEN (replace(lower(trim(c.employee_count)), 'k', '')::numeric * 1000)::bigint::text
+          ELSE NULL END, '')::bigint"""
+
+_EMP_HIGH = """NULLIF(CASE
+          WHEN c.employee_count ~ '^\\s*[0-9]+\\s*$'          THEN trim(c.employee_count)
+          WHEN c.employee_count ~ '^\\s*[0-9,]+\\s*-'         THEN replace(regexp_replace(split_part(c.employee_count, '-', 2), '[^0-9,].*$', '', 'g'), ',', '')
+          WHEN c.employee_count ~ '^\\s*[0-9,]+\\s*\\+'        THEN NULL
+          WHEN c.employee_count ~ '^\\s*[0-9.]+\\s*[Kk]\\s*$'  THEN (replace(lower(trim(c.employee_count)), 'k', '')::numeric * 1000)::bigint::text
+          ELSE NULL END, '')::bigint"""
+
+# CONTAINMENT, not overlap — and it is a deliberate choice between two honest readings.
+#
+# The data is buckets, so "500-1000 employees" cannot always be answered exactly. Two options:
+#   * overlap    — return a company whose bucket *touches* [500,1000]. '201-500 employees' would
+#                  qualify on its single top value, and the company may really have 250 people.
+#   * containment— return a company whose bucket *fits inside* [500,1000]. '501-1,000 employees'
+#                  qualifies; '201-500' does not.
+# Containment is chosen because every returned company then provably satisfies what was asked,
+# which is the claim a filter makes. Overlap would quietly re-introduce false positives on a HARD
+# filter, and a hard filter that returns rows it cannot justify is a filter the user cannot use.
+# An unparseable or NULL `employee_count` fails both bounds: we cannot prove it satisfies them.
+_FIRMO_FILTERS = f"""
+          AND (%(min_employees)s::bigint IS NULL OR {_EMP_LOW} >= %(min_employees)s::bigint)
+          AND (%(max_employees)s::bigint IS NULL OR {_EMP_HIGH} <= %(max_employees)s::bigint)
           AND (%(min_revenue_usd)s::numeric IS NULL OR c.revenue_usd >= %(min_revenue_usd)s::numeric)
           AND (%(max_revenue_usd)s::numeric IS NULL OR c.revenue_usd <= %(max_revenue_usd)s::numeric)
 """
