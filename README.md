@@ -48,7 +48,7 @@ One company = one **tenant**, and the `tenant.modules` field decides which half 
 └─────────────────────────┘        └───────────────┬──────────────┘
                                                     │ JPA
                                             ┌───────▼────────┐
-                                            │  PostgreSQL     │  (64 tables, no FKs)
+                                            │  PostgreSQL     │  (73 tables, no FKs)
                                             └────────────────┘
    (leadplus-intelligence-service: a small Node/Mongo enrichment helper,
     still frozen in Limark/, slated to fold into a future Python AI service)
@@ -1234,3 +1234,69 @@ the **LeadGen engine** and the **RFQ marketplace** in depth, the **AI module** (
 the **cross-cutting plumbing**, the **frontend**, **build/deploy**, and the **migration context** that
 ties it all together. Pair this with [`ISSUES.md`](./ISSUES.md) (the verified gaps) and you can both
 *build* in this codebase and *reason about its risks*. Welcome to the project. 🚀
+
+---
+
+# Addendum — what changed after the course was written (2026-08-11)
+
+The ten Steps above are still an accurate model of the architecture. What has moved is the *state*
+of the platform. Read this before treating any status claim above as current.
+
+## Corrections to the Steps
+
+**Step 1 / Step 9 — the deployables are four, not three.** Alongside the backend and portal:
+
+- **`intel-search`** — a Python/FastAPI intent-search engine (`:8001`) on the *same* PostgreSQL.
+  It reads `lead_company` / `lead_company_job` / `lead_contact` and writes only its own derived
+  tables (`company_signal`, `job_signal`, `job_intent`, `contact_signal`, …). The backend proxies to
+  it via `AIServicesModule` → `IntentSearchClient`. This is Step 6's "Python extraction seam"
+  existing for real, on one capability.
+- **`playwright-extractor`** — a Python scraper (`:8000`). Built, not currently run.
+
+**Step 4 — the lead pool model changed.** Step 4 describes `tenant_ids` as an array with a
+"NULL visible to all" leak. That was remodelled to a scalar nullable `tenant_id`: `NULL` = shared
+platform record, `X` = owned by tenant X, with copy-on-write when a tenant edits a shared row.
+Lead **edit** (PATCH), **revision history** and **delete/restore** now exist on top of it — a PATCH
+of a shared record returns a *different* id, because it silently created your tenant's copy.
+
+**Step 6 — "all AI goes through AIServicesModule" now has a real HTTP hop.** `IntentSearchClient` is
+the first concrete instance of the Phase-3 shape.
+
+**Step 7 / Step 9 — system email was broken, and is now fixed.** The course says notification email
+goes out via SES templates. In fact the migration dropped Limark's `SystemEmailTemplate` +
+`SystemEmailTemplateRenderer`, SES credentials were blank, and `EmailService.safeSend` swallowed the
+failure — so **every** system email failed silently for months. That is the true reason the run
+guide told you to `UPDATE tenant_user SET email_verified = true`. Now restored, with the provider
+runtime-selectable: `system-email.provider` = `MAILGUN` (default) | `SES`.
+
+**Step 9 — the backend deploy pipeline does not run.** Step 9 says "merging to `main` deploys to
+prod". The `deploy.yml` it describes lives in a **nested** `.github/` inside `leadplus-service`, and
+GitHub Actions only executes workflows from the repo root. "Backend Deploy" has never run. What
+*does* run on a PR: Gitleaks, backend test/coverage gate, frontend typecheck/lint/build.
+
+**Step 10 — "we are at the end of Phase 1" is out of date.** Phase 1 closed. The work since has been
+Limark feature waves (waves 2 and 3), the intent-search engine, and making the stack genuinely
+runnable. Phase 2 (Mongo→Postgres cutover) is moot for the Java app — it is fully on Postgres.
+
+## Numbers, re-measured 2026-08-11
+
+| | Course said | Actual |
+|---|---|---|
+| Tests | ~485 | **1,230** across 183 classes, 0 failures (20 env-gated skips) |
+| Coverage | ~33% | ~34.1% instructions, 30% JaCoCo floor |
+| Tables | 64 | **73** in `schema.sql`; 83 in the live DB (+10 intel-search derived) |
+| Classes | ~940 | ~1,104 main + 177 test |
+| Boundary enforcement | 5 strict / 8 backlog | **all 11 modules**, all at zero, **6** exemptions |
+
+## The two live decisions
+
+- **Campaign-agent is kept.** Limark's wave-3 deletes it; Corelabs does not replay that.
+- **The `job_intent` remodel is not ported** — Limark's new table collides by name with
+  intel-search's existing `job_intent`, which holds thousands of live rows the Generate tab depends
+  on. Needs a rename first.
+
+## Where to look now
+
+`ISSUES.md` in this repo is the maintained gap register — it is more current than any `Docs/` file
+in the product repo. Highest-value open item is **D8**: `CampaignMembershipGuard` assumes one shared
+row per email, the pool has ~141 duplicates, and deleting one of those contacts 500s.

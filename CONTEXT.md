@@ -53,10 +53,15 @@ complete mental model of the platform before working on it.
   `src/main/resources/schema.sql`. The app does NOT create its own tables.
 - Build = **Gradle** (not Maven). Container via **jib**. Deploy = AWS ECS. JDK 21 at
   `/home/jathin/jdk/jdk-21.0.11+10`. Local Postgres = docker container `leadplus-pg` (db/user/pass all `leadplus`).
-- Recent history: Anjali's "Limark migration" (PRs #41/#42) added new features (contact add/import,
-  AI column-mapping, data-source tagging, email preview, campaign summaries) but broke `main`'s build;
-  it was repaired by PRs #44/#43/#45. `main` is currently green and boots. (See the memory note
-  `leadplus-main-broken-limark-migration.md`.)
+- Recent history: three Limark feature waves. Wave 1 (PRs #41/#42) broke `main`'s build and was
+  repaired by #43/#44/#45. Wave 2 remodelled the lead pool (`tenant_ids[]` -> scalar `tenant_id` +
+  copy-on-write) and added lead delete/revisions. Wave 3 arrived in `Limark/` via PRs #55/#57; its
+  low-risk half was ported as "Phase A" in PR #56 (lead edit/PATCH, revision history, deleted-lead
+  views, admin system logs, bulk note lookup). PR #58 restored system email. `main` is green.
+- Two standing decisions: the **campaign-agent is kept** in Corelabs (Limark's wave-3 deletes it),
+  and the **`job_intent` remodel is not ported** (its table name collides with the intel-search
+  engine's live one).
+- `Limark/` is no longer strictly frozen — it is the intake point for legacy waves. Still never run it.
 
 ## 5. Progress tracker
 Update this every time a Step is written.
@@ -74,7 +79,15 @@ Update this every time a Step is written.
 | 9 | Build / run / deploy — Gradle, schema/validate, CI/CD, config & secrets | ✅ written |
 | 10 | Migration context — refactor, phases, Java-now/Python-later, known issues | ✅ written |
 
-**Current position:** ✅ **ALL 10 STEPS COMPLETE** (written & pushed). The core course is finished.
+**Current position:** ✅ **ALL 10 STEPS COMPLETE**, plus an **Addendum** at the end of `README.md`
+(added 2026-08-11) recording what changed after the course was written — re-measured numbers, the
+four deployables (intel-search and playwright-extractor were not covered), the lead-pool remodel and
+the edit/revision features on top of it, the system-email defect and its fix, and the fact that the
+backend deploy pipeline has never actually run.
+
+**Read the Addendum before quoting any status claim from Steps 1–10.** The architecture they teach
+is still accurate; the state around it has moved.
+
 Remaining possible follow-ups (only if the learner asks): deep-dives on specific flows, keep
 appending to `ISSUES.md` as new gaps surface, or verify/enable the dormant features (P1 Apollo, P2 Scraper).
 
